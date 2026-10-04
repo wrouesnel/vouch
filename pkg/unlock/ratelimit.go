@@ -5,15 +5,16 @@ import (
 	"time"
 )
 
-// RateLimitConfig caps attempts per client address and per username.
+// RateLimitConfig caps failed attempts per client address and per account.
 type RateLimitConfig struct {
-	// Attempts is how many attempts are allowed within Window. Zero disables the limit.
+	// Attempts is how many failed attempts are allowed within Window. Zero disables the limit.
 	Attempts int `yaml:"attempts"`
 	// Window is the sliding window attempts are counted over.
 	Window time.Duration `yaml:"window"`
 }
 
-// limiter is a sliding-window counter of attempts per key.
+// limiter is a sliding-window counter of failed attempts per key. Successes aren't counted,
+// so a busy service desk machine isn't locked out by its own legitimate unlocks.
 type limiter struct {
 	cfg  RateLimitConfig
 	now  func() time.Time
@@ -42,25 +43,33 @@ func (l *limiter) recent(key string, now time.Time) []time.Time {
 	return hits
 }
 
-// Allow records an attempt against every key, and reports whether all of them were within
-// their limit beforehand. An attempt over the limit is still recorded, so hammering an
-// endpoint keeps it locked.
-func (l *limiter) Allow(keys ...string) bool {
+// Allowed reports whether every key is under its limit of failures.
+func (l *limiter) Allowed(keys ...string) bool {
 	if l.cfg.Attempts <= 0 {
 		return true
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now()
-	allowed := true
 	for _, key := range keys {
-		hits := l.recent(key, now)
-		if len(hits) >= l.cfg.Attempts {
-			allowed = false
+		if len(l.recent(key, now)) >= l.cfg.Attempts {
+			return false
 		}
-		l.hits[key] = append(hits, now)
 	}
-	return allowed
+	return true
+}
+
+// Fail records a failed attempt against every key.
+func (l *limiter) Fail(keys ...string) {
+	if l.cfg.Attempts <= 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	for _, key := range keys {
+		l.hits[key] = append(l.recent(key, now), now)
+	}
 }
 
 // Sweep forgets keys with no recent attempts.

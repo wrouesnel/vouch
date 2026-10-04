@@ -1,6 +1,10 @@
 package unlock
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/wrouesnel/vouch/pkg/directory"
+)
 
 // Code identifies a class of failure. The values match the Problem codes in the API.
 type Code string
@@ -17,6 +21,7 @@ const (
 	CodePresenceMismatch     Code = "presence_mismatch"
 	CodeVoucherNotAuthorised Code = "voucher_not_authorised"
 	CodeVoucherIsClaimant    Code = "voucher_is_claimant"
+	CodeVoucherMismatch      Code = "voucher_mismatch"
 	CodeAttestationRequired  Code = "attestation_required"
 	CodeDirectoryError       Code = "directory_error"
 )
@@ -70,6 +75,11 @@ func errPresenceMismatch() *Error {
 	return newError(CodePresenceMismatch,
 		"This unlock request was started in a different browser or network location, so it has been cancelled. "+
 			"Both people must use the same browser on the same computer.")
+}
+
+func errVoucherMismatch(voucher *directory.User) *Error {
+	return newError(CodeVoucherMismatch,
+		"Sign in as "+voucher.SAMAccountName+", the colleague who started this request.")
 }
 
 func errRateLimited() *Error {

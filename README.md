@@ -7,22 +7,23 @@ vouches for the user in person, in the same browser.
 
 ## How it works
 
-1. **The user enters their username and current password.** vouch binds to AD as them. If AD
-   says the account is locked out, an unlock session starts. If the password simply works, the
-   account isn't locked and the user is told to sign in normally.
-2. **The user hands the device to a colleague, who signs in on the same page.** The colleague
-   must be in one of the configured voucher groups (nested membership counts) and can't be the
-   user. Only now are the user's directory details shown, for the colleague to check against the
-   person in front of them.
-3. **The colleague confirms they are with the user and have confirmed their identity.** vouch
-   clears the account's lockout and immediately binds as the user with the password from step 1,
-   against the same domain controller, to verify it.
+1. **A colleague signs in first.** They must be in one of the configured voucher groups (nested
+   membership counts). This starts an unlock session in their browser.
+2. **The colleague hands the device to the locked-out user, who enters their username and
+   current password.** vouch binds to AD as them. If AD says the account is locked out and it's
+   eligible for self-service unlock, the user's directory details are shown for the colleague to
+   check. If the password simply works, the account isn't locked and nothing more is done. The
+   colleague can't enter their own account here.
+3. **The colleague checks the details, confirms they are with the user and have confirmed their
+   identity, and enters their own username and password again.** It must be the same account
+   that started the session. vouch then clears the account's lockout and immediately binds as
+   the user with the password from step 2, against the same domain controller, to verify it.
 
 ### Why the password is checked after unlocking
 
 While an account is locked, AD rejects every bind with `data 775`, whether or not the password
 is right. There's no way to verify a locked user's password without unlocking the account first.
-vouch therefore holds the password from step 1 in memory, server side only, until the colleague
+vouch therefore holds the password from step 2 in memory, server side only, until the colleague
 confirms. It then unlocks the account and verifies the password straight away. This was confirmed
 against the Samba AD DC in [`test/samba`](test/samba/README.md).
 
@@ -36,22 +37,26 @@ vouch will disable the account instead.
 
 The vouching has to happen in one browser on one machine:
 
-* All three steps share one server-side session, identified by a random ID in an `HttpOnly`,
-  `Secure`, `SameSite=Strict` cookie scoped to `/api/v1`. A second browser, or a colleague signing
-  in remotely, has no session to vouch for.
+* All three steps share one server-side session, started by the colleague's sign-in and
+  identified by a random ID in an `HttpOnly`, `Secure`, `SameSite=Strict` cookie scoped to
+  `/api/v1`. A user in another browser has no session to enter their details into.
 * A session is tied to the client address and User-Agent that started it. A request from
   anywhere else cancels the session outright.
-* Time limits: by default the whole exchange must finish within 5 minutes, and the colleague
-  must confirm within 2 minutes of signing in.
+* The colleague signs in at the start and again at the end, so they have to be at the machine
+  both before and after the user enters their details.
+* Time limits: by default the whole exchange must finish within 5 minutes of the colleague
+  signing in. The colleague must confirm within 2 minutes of the user entering their details,
+  otherwise the user's details are discarded and must be entered again.
 * The colleague has to tick an explicit attestation naming the user before the unlock button
   works.
 * State-changing requests must be same-origin JSON (`Origin`/`Sec-Fetch-Site` checks).
-  Attempts are rate limited per client address and per username.
+  Failed attempts are rate limited per client address and per account, however it's named.
+  Successful steps don't count, so a service desk machine can do many unlocks in a row.
 
 This is presence *enforcement* in the "same browser" sense, not proof that two people were in
-the room. The colleague types their password on the user's machine, so only use vouch on
-machines you'd trust with a help-desk password. The page asks password managers and browsers
-not to save the colleague's credentials, but browsers don't always comply.
+the room. Both people type a password on the same machine, so only use vouch on machines you'd
+trust with both. The page asks password managers and browsers not to save either person's
+credentials, but browsers don't always comply.
 
 ### Audit log
 
@@ -141,7 +146,7 @@ VOUCH_SAMBA_URL=ldap://127.0.0.1:10389 go test -count=1 -run Samba -v ./pkg/dire
 test/samba/stop.sh
 ```
 
-The test domain has `alice` (to unlock), `bob` (in `Helpdesk` through a nested group, so he can
-vouch), `carol` (can't vouch) and `dadmin` (protected). Each user's password is
+The test domain has `alice` (to unlock), `bob` (a voucher, in `Helpdesk` through a nested group),
+`carol` (can't vouch) and `dadmin` (protected). Each user's password is
 `Passw0rd-<name>!`. Lock `alice` out with three bad binds, for example
 `ldapwhoami -x -H ldap://127.0.0.1:10389 -D CN=alice,CN=Users,DC=vouch,DC=test -w wrong`.

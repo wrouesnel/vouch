@@ -51,7 +51,7 @@ type Config struct {
 	Title string `yaml:"title"`
 	// VoucherDescription tells users who can vouch for them.
 	VoucherDescription string `yaml:"voucherDescription"`
-	// HelpText is optional extra guidance on the first step.
+	// HelpText is optional extra guidance shown when the locked-out user enters their details.
 	HelpText string `yaml:"helpText"`
 }
 
@@ -66,7 +66,7 @@ var _ api.ServerInterface = (*Handler)(nil)
 // New builds the Echo server. web holds the built web interface.
 func New(ctx context.Context, cfg Config, svc *unlock.Service, web fs.FS) (*echo.Echo, error) {
 	if cfg.Title == "" {
-		cfg.Title = "Unlock your account"
+		cfg.Title = "Account unlock"
 	}
 	if cfg.VoucherDescription == "" {
 		cfg.VoucherDescription = "an authorised colleague"
@@ -211,6 +211,7 @@ var unlockStatus = map[unlock.Code]int{
 	unlock.CodePresenceMismatch:     http.StatusForbidden,
 	unlock.CodeVoucherNotAuthorised: http.StatusForbidden,
 	unlock.CodeVoucherIsClaimant:    http.StatusForbidden,
+	unlock.CodeVoucherMismatch:      http.StatusForbidden,
 	unlock.CodeAttestationRequired:  http.StatusBadRequest,
 	unlock.CodeDirectoryError:       http.StatusBadGateway,
 }
@@ -360,35 +361,33 @@ func badBody(c *echo.Context) error {
 	return problem(c, http.StatusBadRequest, api.BadRequest, "The request couldn't be read.")
 }
 
-// SubmitClaim implements api.ServerInterface.
-func (h *Handler) SubmitClaim(c *echo.Context) error {
-	var body api.Credentials
-	if err := c.Bind(&body); err != nil {
-		return badBody(c)
-	}
-	ctx := c.Request().Context()
-	// A new claim replaces whatever this browser was doing before.
-	if oldID := h.sessionID(c); oldID != "" {
-		h.svc.Cancel(ctx, oldID)
-		h.clearSession(c)
-	}
-	state, sessionID, err := h.svc.Claim(ctx, h.client(c), body.Username, body.Password)
-	if err != nil {
-		return h.failure(c, err)
-	}
-	if sessionID != "" {
-		h.setSession(c, sessionID, state.ExpiresAt)
-	}
-	return c.JSON(http.StatusOK, toSessionState(state))
-}
-
 // SubmitVoucher implements api.ServerInterface.
 func (h *Handler) SubmitVoucher(c *echo.Context) error {
 	var body api.Credentials
 	if err := c.Bind(&body); err != nil {
 		return badBody(c)
 	}
-	state, err := h.svc.Vouch(c.Request().Context(), h.sessionID(c), h.client(c), body.Username, body.Password)
+	ctx := c.Request().Context()
+	// A voucher signing in replaces whatever this browser was doing before.
+	if oldID := h.sessionID(c); oldID != "" {
+		h.svc.Cancel(ctx, oldID)
+		h.clearSession(c)
+	}
+	state, sessionID, err := h.svc.StartVouch(ctx, h.client(c), body.Username, body.Password)
+	if err != nil {
+		return h.failure(c, err)
+	}
+	h.setSession(c, sessionID, state.ExpiresAt)
+	return c.JSON(http.StatusOK, toSessionState(state))
+}
+
+// SubmitClaim implements api.ServerInterface.
+func (h *Handler) SubmitClaim(c *echo.Context) error {
+	var body api.Credentials
+	if err := c.Bind(&body); err != nil {
+		return badBody(c)
+	}
+	state, err := h.svc.Claim(c.Request().Context(), h.sessionID(c), h.client(c), body.Username, body.Password)
 	if err != nil {
 		return h.failure(c, err)
 	}
@@ -401,7 +400,8 @@ func (h *Handler) ConfirmVouch(c *echo.Context) error {
 	if err := c.Bind(&body); err != nil {
 		return badBody(c)
 	}
-	state, err := h.svc.Confirm(c.Request().Context(), h.sessionID(c), h.client(c), body.Attest)
+	state, err := h.svc.Confirm(c.Request().Context(), h.sessionID(c), h.client(c),
+		body.Username, body.Password, body.Attest)
 	if err != nil {
 		return h.failure(c, err)
 	}

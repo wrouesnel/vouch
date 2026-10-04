@@ -12,9 +12,10 @@ web:
   # trustedProxies: ["10.0.0.0/24"]
   # Drop the Secure flag from the session cookie. Only for plain HTTP on hosts other than localhost.
   # insecureCookies: false
-  title: "Unlock your account"
-  # Finishes the sentence "Ask ... to sign in below."
+  title: "Account unlock"
+  # Who may vouch, in words users understand. Shown as "First, <voucherDescription> signs in here."
   voucherDescription: "a member of the IT Service Desk or your team leader"
+  # Extra guidance shown to the locked-out user when they enter their details.
   # helpText: "Need help? Call the service desk on 1234."
 
 directory:
@@ -46,14 +47,15 @@ policy:
     - "CN=Enterprise Admins,CN=Users,DC=example,DC=com"
   # If set, only members of these groups can be unlocked.
   # eligibleGroups: []
-  # Disable an account if, after unlocking it, the password from step 1 turns out to be wrong.
+  # Disable an account if, after unlocking it, the password the user entered turns out to be wrong.
   disableOnFailedVerification: false
-  # How long the whole exchange may take, and how long the voucher has to confirm.
+  # How long the whole exchange may take from the voucher signing in, and how long the voucher
+  # has to confirm after the user enters their details.
   sessionLifetime: 5m
   confirmWindow: 2m
   # Let a session continue from a different client address (e.g. clients behind rotating NAT).
   allowClientIPChange: false
-  # Attempts allowed per client address and per username.
+  # Failed attempts allowed per client address and per account. Successes don't count.
   rateLimit:
     attempts: 10
     window: 15m

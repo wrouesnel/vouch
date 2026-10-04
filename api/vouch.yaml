@@ -5,10 +5,12 @@ info:
   description: |
     Self-service unlock of locked Active Directory accounts.
 
-    A user whose account is locked proves they know its password, then a colleague from an
-    authorised group signs in on the same browser and vouches that the user is who they claim
-    to be. Every step after the first is tied to a server-side session that lives in an
-    HttpOnly, SameSite=Strict cookie, so the whole exchange has to happen in one browser.
+    An authorised colleague (the voucher) signs in first, starting a session in their browser.
+    The locked-out user then enters their username and password in that same session. Finally the
+    voucher checks the user's details, attests to their identity and re-enters their own
+    credentials to trigger the unlock. Every step after the first is tied to a server-side
+    session that lives in an HttpOnly, SameSite=Strict cookie, so the whole exchange has to
+    happen in one browser.
 
     Errors are returned as a `Problem`. A request that changes state must be sent as
     `application/json` from the same origin.
@@ -45,14 +47,14 @@ paths:
       responses:
         "204":
           description: The session was removed, or there wasn't one.
-  /session/claim:
+  /session/voucher:
     post:
-      operationId: submitClaim
-      summary: Step 1 - the locked-out user enters their username and password
+      operationId: submitVoucher
+      summary: Step 1 - an authorised colleague signs in and starts a session
       description: |
-        Checks the password by binding to the directory. If the account is locked a new session
-        is started and the response is in the `awaiting_voucher` stage. If the password works
-        the account isn't locked and the response is `complete` with outcome `not_locked`.
+        The voucher must be a member, directly or through nested groups, of one of the configured
+        voucher groups. On success a new session starts in the `awaiting_claim` stage. Any
+        session this browser already had is abandoned.
       requestBody:
         required: true
         content:
@@ -68,14 +70,15 @@ paths:
                 $ref: "#/components/schemas/SessionState"
         default:
           $ref: "#/components/responses/Problem"
-  /session/voucher:
+  /session/claim:
     post:
-      operationId: submitVoucher
-      summary: Step 2 - a colleague signs in to vouch for the user
+      operationId: submitClaim
+      summary: Step 2 - the locked-out user enters their username and password
       description: |
-        The voucher must be a member, directly or through nested groups, of one of the configured
-        voucher groups. On success the response is in the `awaiting_confirmation` stage and
-        includes the details of the account being unlocked so the voucher can check them.
+        Binds to the directory as the user. If the account is locked and eligible for
+        self-service unlock, the session moves to `awaiting_confirmation` and the response
+        includes the account's details for the voucher to check. If the password works the
+        account isn't locked, and the session is `complete` with outcome `not_locked`.
       requestBody:
         required: true
         content:
@@ -94,10 +97,11 @@ paths:
   /session/confirm:
     post:
       operationId: confirmVouch
-      summary: Step 3 - the voucher confirms the user's identity and the account is unlocked
+      summary: Step 3 - the voucher confirms the user's identity and signs in again to unlock
       description: |
-        Unlocks the account, then verifies the password given in step 1 against it. The response
-        is `complete` with outcome `unlocked` or `verification_failed`.
+        The voucher must re-enter the credentials of the account that started the session.
+        The account is then unlocked and the password given in step 2 is verified against it.
+        The response is `complete` with outcome `unlocked` or `verification_failed`.
       requestBody:
         required: true
         content:
@@ -134,13 +138,13 @@ components:
           description: Who may vouch for a user, in words the user understands.
         helpText:
           type: string
-          description: Optional extra guidance shown on the first step.
+          description: Optional extra guidance shown when the locked-out user enters their details.
         sessionLifetimeSeconds:
           type: integer
-          description: How long a session lasts from step 1.
+          description: How long a session lasts from the voucher signing in.
         confirmWindowSeconds:
           type: integer
-          description: How long the voucher has to confirm after signing in.
+          description: How long the voucher has to confirm after the user enters their details.
     Credentials:
       type: object
       required: [username, password]
@@ -157,21 +161,31 @@ components:
           format: password
     Confirmation:
       type: object
-      required: [attest]
+      required: [username, password, attest]
       properties:
+        username:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: The voucher's username, which must be the account that started the session.
+        password:
+          type: string
+          minLength: 1
+          maxLength: 1024
+          format: password
         attest:
           type: boolean
           description: The voucher attests that they are with the user in person and have confirmed their identity.
     Stage:
       type: string
-      enum: [start, awaiting_voucher, awaiting_confirmation, complete]
+      enum: [start, awaiting_claim, awaiting_confirmation, complete]
     Outcome:
       type: string
       enum: [not_locked, unlocked, verification_failed, ineligible]
       description: |
         * `not_locked` - the password works, so the account isn't locked.
         * `unlocked` - the account was unlocked and the password verified.
-        * `verification_failed` - the account was unlocked but the password from step 1 was wrong.
+        * `verification_failed` - the account was unlocked but the password from step 2 was wrong.
         * `ineligible` - this account can't be unlocked by self-service.
     Account:
       type: object
@@ -197,7 +211,7 @@ components:
           $ref: "#/components/schemas/Stage"
         claimedUsername:
           type: string
-          description: The username entered in step 1.
+          description: The username entered in step 2.
         voucher:
           $ref: "#/components/schemas/Account"
         target:
@@ -214,7 +228,7 @@ components:
         confirmBy:
           type: string
           format: date-time
-          description: In `awaiting_confirmation`, when the voucher's sign-in expires.
+          description: In `awaiting_confirmation`, when the user's details expire and must be entered again.
     Problem:
       type: object
       required: [code, message]
@@ -232,6 +246,7 @@ components:
             - presence_mismatch
             - voucher_not_authorised
             - voucher_is_claimant
+            - voucher_mismatch
             - attestation_required
             - directory_error
         message:

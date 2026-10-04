@@ -53,6 +53,7 @@ const (
 	RateLimited          ProblemCode = "rate_limited"
 	SessionExpired       ProblemCode = "session_expired"
 	VoucherIsClaimant    ProblemCode = "voucher_is_claimant"
+	VoucherMismatch      ProblemCode = "voucher_mismatch"
 	VoucherNotAuthorised ProblemCode = "voucher_not_authorised"
 	WrongStage           ProblemCode = "wrong_stage"
 )
@@ -80,6 +81,8 @@ func (e ProblemCode) Valid() bool {
 		return true
 	case VoucherIsClaimant:
 		return true
+	case VoucherMismatch:
+		return true
 	case VoucherNotAuthorised:
 		return true
 	case WrongStage:
@@ -91,8 +94,8 @@ func (e ProblemCode) Valid() bool {
 
 // Defines values for Stage.
 const (
+	AwaitingClaim        Stage = "awaiting_claim"
 	AwaitingConfirmation Stage = "awaiting_confirmation"
-	AwaitingVoucher      Stage = "awaiting_voucher"
 	Complete             Stage = "complete"
 	Start                Stage = "start"
 )
@@ -100,9 +103,9 @@ const (
 // Valid indicates whether the value is a known member of the Stage enum.
 func (e Stage) Valid() bool {
 	switch e {
-	case AwaitingConfirmation:
+	case AwaitingClaim:
 		return true
-	case AwaitingVoucher:
+	case AwaitingConfirmation:
 		return true
 	case Complete:
 		return true
@@ -126,7 +129,11 @@ type Account struct {
 // Confirmation defines model for Confirmation.
 type Confirmation struct {
 	// Attest The voucher attests that they are with the user in person and have confirmed their identity.
-	Attest bool `json:"attest"`
+	Attest   bool   `json:"attest"`
+	Password string `json:"password"`
+
+	// Username The voucher's username, which must be the account that started the session.
+	Username string `json:"username"`
 }
 
 // Credentials defines model for Credentials.
@@ -139,13 +146,13 @@ type Credentials struct {
 
 // Info defines model for Info.
 type Info struct {
-	// ConfirmWindowSeconds How long the voucher has to confirm after signing in.
+	// ConfirmWindowSeconds How long the voucher has to confirm after the user enters their details.
 	ConfirmWindowSeconds int `json:"confirmWindowSeconds"`
 
-	// HelpText Optional extra guidance shown on the first step.
+	// HelpText Optional extra guidance shown when the locked-out user enters their details.
 	HelpText *string `json:"helpText,omitempty"`
 
-	// SessionLifetimeSeconds How long a session lasts from step 1.
+	// SessionLifetimeSeconds How long a session lasts from the voucher signing in.
 	SessionLifetimeSeconds int `json:"sessionLifetimeSeconds"`
 
 	// Title Page title.
@@ -157,7 +164,7 @@ type Info struct {
 
 // Outcome * `not_locked` - the password works, so the account isn't locked.
 // * `unlocked` - the account was unlocked and the password verified.
-// * `verification_failed` - the account was unlocked but the password from step 1 was wrong.
+// * `verification_failed` - the account was unlocked but the password from step 2 was wrong.
 // * `ineligible` - this account can't be unlocked by self-service.
 type Outcome string
 
@@ -172,10 +179,10 @@ type ProblemCode string
 
 // SessionState defines model for SessionState.
 type SessionState struct {
-	// ClaimedUsername The username entered in step 1.
+	// ClaimedUsername The username entered in step 2.
 	ClaimedUsername *string `json:"claimedUsername,omitempty"`
 
-	// ConfirmBy In `awaiting_confirmation`, when the voucher's sign-in expires.
+	// ConfirmBy In `awaiting_confirmation`, when the user's details expire and must be entered again.
 	ConfirmBy *time.Time `json:"confirmBy,omitempty"`
 
 	// ExpiresAt When the session expires.
@@ -186,7 +193,7 @@ type SessionState struct {
 
 	// Outcome * `not_locked` - the password works, so the account isn't locked.
 	// * `unlocked` - the account was unlocked and the password verified.
-	// * `verification_failed` - the account was unlocked but the password from step 1 was wrong.
+	// * `verification_failed` - the account was unlocked but the password from step 2 was wrong.
 	// * `ineligible` - this account can't be unlocked by self-service.
 	Outcome *Outcome `json:"outcome,omitempty"`
 	Stage   Stage    `json:"stage"`
@@ -217,13 +224,13 @@ type ServerInterface interface {
 	// GetSession The current unlock session of this browser
 	// (GET /session)
 	GetSession(ctx *echo.Context) error
-	// SubmitClaim Step 1 - the locked-out user enters their username and password
+	// SubmitClaim Step 2 - the locked-out user enters their username and password
 	// (POST /session/claim)
 	SubmitClaim(ctx *echo.Context) error
-	// ConfirmVouch Step 3 - the voucher confirms the user's identity and the account is unlocked
+	// ConfirmVouch Step 3 - the voucher confirms the user's identity and signs in again to unlock
 	// (POST /session/confirm)
 	ConfirmVouch(ctx *echo.Context) error
-	// SubmitVoucher Step 2 - a colleague signs in to vouch for the user
+	// SubmitVoucher Step 1 - an authorised colleague signs in and starts a session
 	// (POST /session/voucher)
 	SubmitVoucher(ctx *echo.Context) error
 }
@@ -337,8 +344,8 @@ func RegisterHandlersWithOptions(router EchoRouter, si ServerInterface, options 
 	router.GET(options.BaseURL+"/info", wrapper.GetInfo, options.OperationMiddlewares["getInfo"]...)
 	router.DELETE(options.BaseURL+"/session", wrapper.CancelSession, options.OperationMiddlewares["cancelSession"]...)
 	router.GET(options.BaseURL+"/session", wrapper.GetSession, options.OperationMiddlewares["getSession"]...)
-	router.POST(options.BaseURL+"/session/claim", wrapper.SubmitClaim, options.OperationMiddlewares["submitClaim"]...)
 	router.POST(options.BaseURL+"/session/voucher", wrapper.SubmitVoucher, options.OperationMiddlewares["submitVoucher"]...)
+	router.POST(options.BaseURL+"/session/claim", wrapper.SubmitClaim, options.OperationMiddlewares["submitClaim"]...)
 	router.POST(options.BaseURL+"/session/confirm", wrapper.ConfirmVouch, options.OperationMiddlewares["confirmVouch"]...)
 
 }
@@ -348,39 +355,40 @@ func RegisterHandlersWithOptions(router EchoRouter, si ServerInterface, options 
 // const string: with thousands of chunks the chained `+` fold is several
 // times slower for the Go compiler than parsing a slice literal.
 var swaggerSpec = []string{
-	"5Fjdj+O2Ef9XBmqBAwKt9z7SPhjow+YuaBZIsgd4kzzEB5uWxtJkpaHKoewzDv7fC5KiLNnybQrcoQX6",
-	"pg9yOB+/+c0MPyWZrhvNyFaS+afEoDSaBf3Le6M3FdbuMdNska17VE1TUaYsab79QzS7b5KVWCv39FeD",
-	"22Se/OX2JPc2/JXbKO94PKZJjpIZapyYZJ48lggG/9WiWNgqqjCfJW5Vt9VJvssy3QYVGqMbNJaCmjk2",
-	"yti6U88eGkzmiVhDXCTnB039J2kqdfhZ1Tj5v1ZUTf6wZKvpLa2g4Wl5xzRxdpLBPJn/flo51uNDGvfp",
-	"zR+YWSf0reYtmVpFQ8ZOUNai2OCOc8fudJuVaCCsEbClsmBLPIAyCHuypXsDpwsQQ4NGNIPiHEq1Q8jC",
-	"wZi7VWSAcmRL9jBLei03Wleo+MK8TqtJcwx6OaqSS2saJbLXJnfPW+2MTuanjy4mH39ELmyZzF+9fP1t",
-	"mtTE/Yf08wEZ+0fufuqA5Ryfeie8N8QZNapyn0AbePfw0939z8vlePFsrMjrv/39GT2ux743bcpT97zV",
-	"ly7qovIbca73C8w053Jp3g96D5XmAuwAB6USsDrGFdTWogGhgokLIB7EldhigcZpUWLVPOLHCYg9+AdV",
-	"AX60RkHRUq44Q5BS7xk0+7O3ZMSCWGxmyYVj0kRQhDT/SFu0VOPz9ijotkClHKa3RtdePLya1r/P1rHA",
-	"96pA8P8m9epc9m7MIWMRv5UaanUI7oWtNqA8jFKXTC6qckqvlnM0YhXnMkueA0hQeVKJqx5Lp4ExhauH",
-	"1mZ6Kie+gTVru6p09oT5Gm68+hGizqInSUG0/6xCPgAJv7AQtsyW/A2sWx4LiCv3SiD+8yQzkr5DQ1uK",
-	"MsJbKDarUBc+K27T2rG4ASz8yr3RXATZxFhRQZsKg0iSXmamnDEbHAg+gGC1vRE0O8pwtnQhQG5rF6eT",
-	"s5I0iVtc3C61T9LkdG7y4QIB6bDonid87mMVT92ofNWVTC91pyrKV9mAVtOkM2hl0B2QWa+AURZXFdUU",
-	"XlmvOiydULXCj41HYZp4j63EqsITlUFBznBVk9TKZuUJnivnBtXaUhsSzAc/SFZZpahW7DQNNSE4pUe7",
-	"K38GM6vNYYXGaDPpmxpFVPEnyqr31Wn9FPoXwdKFVRYnnO30xfyXq3Xjscto9xeQLRrMXb5fUNBJ+y4x",
-	"vztcSrtnWKu9IktcrLJBoV+nsC+Rh/T9QjxX3xBDiJJnkr5K5srijWOEKRW6DXd2isW6YyKv/sfCB9EZ",
-	"i76Dsq0V3xhUudpU6ERXir2BoLf+VB3IaNJx+kRUn2svI5+5cmJV8ez6hV/kSoMyBdrnlsf+81QV/vSO",
-	"M3SKvQrKqHdMcrHK+KSJ4IhHp8kkXjz/102FdopdnCLUdRPjEC0G5NaxnotMx353maUdwruYopEoZbbk",
-	"Jd+F0rYvtQzrQdzcGL1DCf3mE+s9kJWeoFP3nUFBpqsKVdFioGzFSz5xCRRGt42HvQD1PYW43NsYvXfH",
-	"u0oSnHNqcINiJE63oIDP6yVbDRucwfc7NIeQsqEJOnUqJGDJtbzatxpmh+ZGKD+lhz+jImcasdf3B2ub",
-	"B64OKSxUjQuy+I+FZ13ItH4i7GvmvtQ+CbJScYGxHStV0yAH83qzvIO/N0Yb8c26QdsadoVTQMG6Kxbr",
-	"Gdz145NXLIgWcESLULfiy5kgW1Cy5PX5ELcObu+9qg0VxKHMdZ1TQH0oaxJQ88pnZ4OsGkrmyZvZy9kb",
-	"383a0rPobQRbl16OYf2Z93kyT/6J1re26XjqfP3y5RebOL38iXHzni2arcqcS6xLIgnTZlvXyhx8PoTP",
-	"IV64Aep3MGLuA2bQNXN+422soD6xfPZdmPvWNcXVoi+1Z0Z/O11jItxc82Kw1jvMU9AeqW52U77t0oyz",
-	"MwPuNorzLk+y1hgX+S6vo67H9Gpcrmr55UIzqr9XbgSi8R7FM1h74ly73Fx7YlwDbTtPkADruGEW5v6t",
-	"aqurtN4bNriWGDrw8arjQskiiTk6QsCtZxh3aKOn5vG3JWZPMm5SNwfYEOdu+rKBIfpmaAb327M+O/Kq",
-	"AsZ91GnJ5JPd2EFTHU10myhAYX1eSNbgndqfM27zl3ytx588ZB1rzzrcKnSFezROBE4ZI27Rbmqyb73n",
-	"QqlEsd/p/PDF0Da8bTiO67E1LR7/y0AfRLID+xdA8CKMPWFcCt6/0a0NRdG3rNLd6PSNrAtqRMAZrEOT",
-	"cR3Yv/gckSFYu+LejXRnoC9oF6pdN52pQhGLBbIzeBzgasmfA9ZpyNRmelycwlt3lfZrV9C+CuCGTdn/",
-	"IOK25G5svg7m3nSYi/dNHXZO1yAvpL9E7HlkQHAxqGMEDpruaQQOrzpjx6OgxnqDJu0otTqE4ml0W5TA",
-	"KDZ2l5I6XteMcSLxWhetwXzJUWxYOYMHBmmzDEWeJ9rROBfY1hm9ZOKsavMuL3K0iiqJh0dvbNBVheiQ",
-	"2ED2jlUMmSso7mt9nVl/7YeG/0NubRs3teZfCeuv4WY0vfQzitWDC8EI/KBjGCckmf/+KWlNlcyTW9XQ",
-	"7e5Vcvxw/PcA",
+	"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",
 }
 
 // decodeSpec returns the embedded OpenAPI spec as raw JSON bytes,

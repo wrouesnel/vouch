@@ -198,18 +198,18 @@ func TestSambaWorkflow(t *testing.T) {
 	}
 	lockOut(t, dir, alice)
 
-	state, sessionID, err := svc.Claim(ctx, client, "alice", sambaPassword("alice"))
-	if err != nil || state.Stage != unlock.StageAwaitingVoucher {
-		t.Fatalf("claim: %+v %v", state, err)
-	}
-	if _, err := svc.Vouch(ctx, sessionID, client, "carol", sambaPassword("carol")); err == nil {
+	if _, _, err := svc.StartVouch(ctx, client, "carol", sambaPassword("carol")); err == nil {
 		t.Fatal("carol isn't in Helpdesk and must not be able to vouch")
 	}
-	state, err = svc.Vouch(ctx, sessionID, client, "bob", sambaPassword("bob"))
-	if err != nil || state.Stage != unlock.StageAwaitingConfirmation {
-		t.Fatalf("vouch: %+v %v", state, err)
+	state, sessionID, err := svc.StartVouch(ctx, client, "bob", sambaPassword("bob"))
+	if err != nil || state.Stage != unlock.StageAwaitingClaim {
+		t.Fatalf("voucher sign-in: %+v %v", state, err)
 	}
-	state, err = svc.Confirm(ctx, sessionID, client, true)
+	state, err = svc.Claim(ctx, sessionID, client, "alice", sambaPassword("alice"))
+	if err != nil || state.Stage != unlock.StageAwaitingConfirmation {
+		t.Fatalf("claim: %+v %v", state, err)
+	}
+	state, err = svc.Confirm(ctx, sessionID, client, "bob", sambaPassword("bob"), true)
 	if err != nil || state.Outcome != unlock.OutcomeUnlocked {
 		t.Fatalf("confirm: %+v %v", state, err)
 	}
@@ -223,13 +223,13 @@ func TestSambaWorkflow(t *testing.T) {
 			t.Fatal(err)
 		}
 		lockOut(t, dir, dadmin)
-		_, sessionID, err := svc.Claim(ctx, client, "dadmin", sambaPassword("dadmin"))
+		_, sessionID, err := svc.StartVouch(ctx, client, "bob", sambaPassword("bob"))
 		if err != nil {
 			t.Fatal(err)
 		}
-		state, err := svc.Vouch(ctx, sessionID, client, "bob", sambaPassword("bob"))
+		state, err := svc.Claim(ctx, sessionID, client, "dadmin", sambaPassword("dadmin"))
 		if err != nil || state.Outcome != unlock.OutcomeIneligible {
-			t.Fatalf("vouch for protected user: %+v %v", state, err)
+			t.Fatalf("claim for protected user: %+v %v", state, err)
 		}
 		if result, _ := dir.Authenticate(ctx, dadmin, []byte(sambaPassword("dadmin"))); result != directory.BindLockedOut {
 			t.Fatalf("dadmin must stay locked: %v", result)

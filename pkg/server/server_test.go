@@ -115,10 +115,10 @@ func TestFullFlow(t *testing.T) {
 		t.Fatalf("initial stage: %s", state.Stage)
 	}
 
-	rec = b.do(http.MethodPost, "/api/v1/session/claim", api.Credentials{Username: "alice", Password: "alice-password"})
+	rec = b.do(http.MethodPost, "/api/v1/session/voucher", api.Credentials{Username: "bob", Password: "bob-password"})
 	wantStatus(t, rec, http.StatusOK)
-	if state := decode[api.SessionState](t, rec); state.Stage != api.AwaitingVoucher {
-		t.Fatalf("after claim: %s", state.Stage)
+	if state := decode[api.SessionState](t, rec); state.Stage != api.AwaitingClaim || state.Voucher == nil {
+		t.Fatalf("after voucher sign-in: %+v", state)
 	}
 	if b.cookie == nil {
 		t.Fatal("no session cookie set")
@@ -127,14 +127,15 @@ func TestFullFlow(t *testing.T) {
 		t.Fatalf("session cookie flags: %+v", b.cookie)
 	}
 
-	rec = b.do(http.MethodPost, "/api/v1/session/voucher", api.Credentials{Username: "bob", Password: "bob-password"})
+	rec = b.do(http.MethodPost, "/api/v1/session/claim", api.Credentials{Username: "alice", Password: "alice-password"})
 	wantStatus(t, rec, http.StatusOK)
 	state := decode[api.SessionState](t, rec)
 	if state.Stage != api.AwaitingConfirmation || state.Target == nil || state.Target.Username != "alice" {
-		t.Fatalf("after vouch: %+v", state)
+		t.Fatalf("after claim: %+v", state)
 	}
 
-	rec = b.do(http.MethodPost, "/api/v1/session/confirm", api.Confirmation{Attest: true})
+	rec = b.do(http.MethodPost, "/api/v1/session/confirm",
+		api.Confirmation{Username: "bob", Password: "bob-password", Attest: true})
 	wantStatus(t, rec, http.StatusOK)
 	state = decode[api.SessionState](t, rec)
 	if state.Outcome == nil || *state.Outcome != api.Unlocked {
@@ -153,29 +154,29 @@ func TestFullFlow(t *testing.T) {
 	}
 }
 
-func TestOtherBrowserCannotVouch(t *testing.T) {
+func TestOtherBrowserCannotClaim(t *testing.T) {
 	e, _ := newServer(t)
-	claimant := newBrowser(t, e)
-	wantStatus(t, claimant.do(http.MethodPost, "/api/v1/session/claim",
-		api.Credentials{Username: "alice", Password: "alice-password"}), http.StatusOK)
+	voucher := newBrowser(t, e)
+	wantStatus(t, voucher.do(http.MethodPost, "/api/v1/session/voucher",
+		api.Credentials{Username: "bob", Password: "bob-password"}), http.StatusOK)
 
 	// Without the cookie there is no session.
 	other := newBrowser(t, e)
-	rec := other.do(http.MethodPost, "/api/v1/session/voucher", api.Credentials{Username: "bob", Password: "bob-password"})
+	rec := other.do(http.MethodPost, "/api/v1/session/claim", api.Credentials{Username: "alice", Password: "alice-password"})
 	wantStatus(t, rec, http.StatusConflict)
 	if problem := decode[api.Problem](t, rec); problem.Code != api.NoSession {
 		t.Fatalf("problem: %+v", problem)
 	}
 
 	// With a stolen cookie but from another machine, the session is cancelled.
-	other.cookie = claimant.cookie
+	other.cookie = voucher.cookie
 	other.remote = "198.51.100.7:4000"
-	rec = other.do(http.MethodPost, "/api/v1/session/voucher", api.Credentials{Username: "bob", Password: "bob-password"})
+	rec = other.do(http.MethodPost, "/api/v1/session/claim", api.Credentials{Username: "alice", Password: "alice-password"})
 	wantStatus(t, rec, http.StatusForbidden)
 	if problem := decode[api.Problem](t, rec); problem.Code != api.PresenceMismatch {
 		t.Fatalf("problem: %+v", problem)
 	}
-	rec = claimant.do(http.MethodGet, "/api/v1/session", nil)
+	rec = voucher.do(http.MethodGet, "/api/v1/session", nil)
 	if state := decode[api.SessionState](t, rec); state.Stage != api.Start {
 		t.Fatalf("session should be gone: %+v", state)
 	}
@@ -184,24 +185,24 @@ func TestOtherBrowserCannotVouch(t *testing.T) {
 func TestCrossSiteRequestsRejected(t *testing.T) {
 	e, _ := newServer(t)
 	b := newBrowser(t, e)
-	creds := api.Credentials{Username: "alice", Password: "alice-password"}
+	creds := api.Credentials{Username: "bob", Password: "bob-password"}
 
-	rec := b.do(http.MethodPost, "/api/v1/session/claim", creds, func(r *http.Request) {
+	rec := b.do(http.MethodPost, "/api/v1/session/voucher", creds, func(r *http.Request) {
 		r.Header.Set("Origin", "https://evil.example")
 	})
 	wantStatus(t, rec, http.StatusForbidden)
 
-	rec = b.do(http.MethodPost, "/api/v1/session/claim", creds, func(r *http.Request) {
+	rec = b.do(http.MethodPost, "/api/v1/session/voucher", creds, func(r *http.Request) {
 		r.Header.Set("Sec-Fetch-Site", "cross-site")
 	})
 	wantStatus(t, rec, http.StatusForbidden)
 
-	rec = b.do(http.MethodPost, "/api/v1/session/claim", creds, func(r *http.Request) {
+	rec = b.do(http.MethodPost, "/api/v1/session/voucher", creds, func(r *http.Request) {
 		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	})
 	wantStatus(t, rec, http.StatusUnsupportedMediaType)
 
-	rec = b.do(http.MethodPost, "/api/v1/session/claim", creds, func(r *http.Request) {
+	rec = b.do(http.MethodPost, "/api/v1/session/voucher", creds, func(r *http.Request) {
 		r.Header.Set("Origin", "https://vouch.example.test")
 		r.Header.Set("Sec-Fetch-Site", "same-origin")
 	})
@@ -213,10 +214,9 @@ func TestErrorsAreProblems(t *testing.T) {
 	b := newBrowser(t, e)
 
 	rec := b.do(http.MethodPost, "/api/v1/session/claim", api.Credentials{Username: "alice", Password: "nope"})
-	// alice is locked, so even a wrong password moves on: AD can't tell.
-	wantStatus(t, rec, http.StatusOK)
+	wantStatus(t, rec, http.StatusConflict) // no voucher has signed in
 
-	rec = b.do(http.MethodPost, "/api/v1/session/claim", api.Credentials{Username: "bob", Password: "nope"})
+	rec = b.do(http.MethodPost, "/api/v1/session/voucher", api.Credentials{Username: "bob", Password: "nope"})
 	wantStatus(t, rec, http.StatusUnauthorized)
 	if problem := decode[api.Problem](t, rec); problem.Code != api.InvalidCredentials {
 		t.Fatalf("problem: %+v", problem)
@@ -228,7 +228,7 @@ func TestErrorsAreProblems(t *testing.T) {
 		t.Fatal("unknown API paths should return a Problem")
 	}
 
-	rec = b.do(http.MethodPost, "/api/v1/session/claim", nil, func(r *http.Request) {
+	rec = b.do(http.MethodPost, "/api/v1/session/voucher", nil, func(r *http.Request) {
 		r.Header.Set("Content-Type", "application/json")
 		r.Body = http.NoBody
 	})

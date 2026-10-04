@@ -51,6 +51,7 @@ func newFixture(t *testing.T, mutate ...func(*unlock.Policy)) *fixture {
 	dir := directorytest.NewFake()
 	dir.Add("alice", alicePass, staff)
 	dir.Add("bob", bobPass, helpdesk, staff)
+	dir.Add("dave", "dave-password", helpdesk, staff)
 	dir.Add("carol", "carol-password", staff)
 	dir.Add("root", "root-password", admins)
 	dir.Lock("alice")
@@ -86,33 +87,41 @@ func wantCode(t *testing.T, err error, code unlock.Code) {
 	}
 }
 
-// claimAndVouch runs steps 1 and 2 for alice with bob vouching.
-func (f *fixture) claimAndVouch(t *testing.T, password string) string {
+// start runs step 1 with bob as the voucher.
+func (f *fixture) start(t *testing.T) string {
 	t.Helper()
-	state, sessionID, err := f.svc.Claim(f.ctx, f.client, "alice", password)
+	state, sessionID, err := f.svc.StartVouch(f.ctx, f.client, "bob", bobPass)
 	if err != nil {
-		t.Fatalf("claim: %v", err)
+		t.Fatalf("start: %v", err)
 	}
-	if state.Stage != unlock.StageAwaitingVoucher || sessionID == "" {
-		t.Fatalf("claim: got %+v", state)
-	}
-	if state.Target != nil {
-		t.Fatal("target details must not be shown before a voucher signs in")
-	}
-	state, err = f.svc.Vouch(f.ctx, sessionID, f.client, "bob", bobPass)
-	if err != nil {
-		t.Fatalf("vouch: %v", err)
-	}
-	if state.Stage != unlock.StageAwaitingConfirmation || state.Target == nil || state.Target.SAMAccountName != "alice" {
-		t.Fatalf("vouch: got %+v", state)
+	if state.Stage != unlock.StageAwaitingClaim || sessionID == "" || state.Voucher == nil || state.Target != nil {
+		t.Fatalf("start: got %+v", state)
 	}
 	return sessionID
 }
 
+// startAndClaim runs steps 1 and 2 for alice with bob vouching.
+func (f *fixture) startAndClaim(t *testing.T, password string) string {
+	t.Helper()
+	sessionID := f.start(t)
+	state, err := f.svc.Claim(f.ctx, sessionID, f.client, "alice", password)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if state.Stage != unlock.StageAwaitingConfirmation || state.Target == nil || state.Target.SAMAccountName != "alice" {
+		t.Fatalf("claim: got %+v", state)
+	}
+	return sessionID
+}
+
+func (f *fixture) confirm(sessionID string) (unlock.State, error) {
+	return f.svc.Confirm(f.ctx, sessionID, f.client, "bob", bobPass, true)
+}
+
 func TestHappyPath(t *testing.T) {
 	f := newFixture(t)
-	sessionID := f.claimAndVouch(t, alicePass)
-	state, err := f.svc.Confirm(f.ctx, sessionID, f.client, true)
+	sessionID := f.startAndClaim(t, alicePass)
+	state, err := f.confirm(sessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,17 +132,70 @@ func TestHappyPath(t *testing.T) {
 		t.Fatal("alice should be unlocked")
 	}
 	// Replaying the confirmation does nothing.
-	_, err = f.svc.Confirm(f.ctx, sessionID, f.client, true)
+	_, err = f.confirm(sessionID)
 	wantCode(t, err, unlock.CodeWrongStage)
 	if f.dir.Unlocks != 1 {
 		t.Fatalf("unlocks: got %d, want 1", f.dir.Unlocks)
 	}
 }
 
+func TestVoucherSignIn(t *testing.T) {
+	f := newFixture(t)
+	cases := []struct {
+		username, password string
+		code               unlock.Code
+	}{
+		{"carol", "carol-password", unlock.CodeVoucherNotAuthorised},
+		{"bob", "wrong", unlock.CodeInvalidCredentials},
+		{"nobody", "whatever", unlock.CodeInvalidCredentials},
+		{"alice", alicePass, unlock.CodeInvalidCredentials}, // locked accounts can't vouch
+		{"bob", "", unlock.CodeBadRequest},
+	}
+	for _, tc := range cases {
+		state, sessionID, err := f.svc.StartVouch(f.ctx, f.client, tc.username, tc.password)
+		wantCode(t, err, tc.code)
+		if sessionID != "" || state.Stage != unlock.StageStart {
+			t.Fatalf("%s: a failed sign-in must not start a session", tc.username)
+		}
+	}
+	f.dir.Err = errors.New("dc down")
+	_, _, err := f.svc.StartVouch(f.ctx, f.client, "bob", bobPass)
+	wantCode(t, err, unlock.CodeDirectoryError)
+}
+
+func TestClaimOutcomes(t *testing.T) {
+	f := newFixture(t)
+	sessionID := f.start(t)
+
+	_, err := f.svc.Claim(f.ctx, sessionID, f.client, "bob", bobPass)
+	wantCode(t, err, unlock.CodeVoucherIsClaimant)
+	_, err = f.svc.Claim(f.ctx, sessionID, f.client, "carol", "wrong")
+	wantCode(t, err, unlock.CodeInvalidCredentials)
+	_, err = f.svc.Claim(f.ctx, sessionID, f.client, "nobody", "whatever")
+	wantCode(t, err, unlock.CodeInvalidCredentials)
+	_, err = f.svc.Claim(f.ctx, sessionID, f.client, "alice", "")
+	wantCode(t, err, unlock.CodeBadRequest)
+
+	// Rejected claims leave the session waiting for the user.
+	state, err := f.svc.State(f.ctx, sessionID, f.client)
+	if err != nil || state.Stage != unlock.StageAwaitingClaim {
+		t.Fatalf("got %+v, %v", state, err)
+	}
+	if _, err := f.confirm(sessionID); err == nil {
+		t.Fatal("confirm must not be possible before a claim")
+	}
+
+	// An account whose password works isn't locked.
+	state, err = f.svc.Claim(f.ctx, sessionID, f.client, "carol", "carol-password")
+	if err != nil || state.Outcome != unlock.OutcomeNotLocked {
+		t.Fatalf("got %+v, %v", state, err)
+	}
+}
+
 func TestWrongPasswordIsOnlyDetectedAfterUnlock(t *testing.T) {
 	f := newFixture(t)
-	sessionID := f.claimAndVouch(t, "not-alices-password")
-	state, err := f.svc.Confirm(f.ctx, sessionID, f.client, true)
+	sessionID := f.startAndClaim(t, "not-alices-password")
+	state, err := f.confirm(sessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,8 +209,8 @@ func TestWrongPasswordIsOnlyDetectedAfterUnlock(t *testing.T) {
 
 func TestDisableOnFailedVerification(t *testing.T) {
 	f := newFixture(t, func(p *unlock.Policy) { p.DisableOnFailedVerification = true })
-	sessionID := f.claimAndVouch(t, "not-alices-password")
-	state, err := f.svc.Confirm(f.ctx, sessionID, f.client, true)
+	sessionID := f.startAndClaim(t, "not-alices-password")
+	state, err := f.confirm(sessionID)
 	if err != nil || state.Outcome != unlock.OutcomeVerificationFailed {
 		t.Fatalf("got %+v, %v", state, err)
 	}
@@ -157,65 +219,11 @@ func TestDisableOnFailedVerification(t *testing.T) {
 	}
 }
 
-func TestClaimNotLocked(t *testing.T) {
-	f := newFixture(t)
-	state, sessionID, err := f.svc.Claim(f.ctx, f.client, "carol", "carol-password")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if state.Outcome != unlock.OutcomeNotLocked || sessionID != "" {
-		t.Fatalf("got %+v, session %q", state, sessionID)
-	}
-}
-
-func TestClaimRejections(t *testing.T) {
-	f := newFixture(t)
-	_, _, err := f.svc.Claim(f.ctx, f.client, "carol", "wrong")
-	wantCode(t, err, unlock.CodeInvalidCredentials)
-	_, _, err = f.svc.Claim(f.ctx, f.client, "nobody", "whatever")
-	wantCode(t, err, unlock.CodeInvalidCredentials)
-	_, _, err = f.svc.Claim(f.ctx, f.client, "alice", "")
-	wantCode(t, err, unlock.CodeBadRequest)
-
-	f.dir.Err = errors.New("dc down")
-	_, _, err = f.svc.Claim(f.ctx, f.client, "alice", alicePass)
-	wantCode(t, err, unlock.CodeDirectoryError)
-}
-
-func TestVoucherRules(t *testing.T) {
-	f := newFixture(t)
-	_, sessionID, err := f.svc.Claim(f.ctx, f.client, "alice", alicePass)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	_, err = f.svc.Vouch(f.ctx, sessionID, f.client, "alice", alicePass)
-	wantCode(t, err, unlock.CodeVoucherIsClaimant)
-	_, err = f.svc.Vouch(f.ctx, sessionID, f.client, `EXAMPLE\ALICE`, alicePass)
-	wantCode(t, err, unlock.CodeVoucherIsClaimant)
-	_, err = f.svc.Vouch(f.ctx, sessionID, f.client, "carol", "carol-password")
-	wantCode(t, err, unlock.CodeVoucherNotAuthorised)
-	_, err = f.svc.Vouch(f.ctx, sessionID, f.client, "bob", "wrong")
-	wantCode(t, err, unlock.CodeInvalidCredentials)
-
-	// Rejected vouchers leave the session waiting for another.
-	state, err := f.svc.State(f.ctx, sessionID, f.client)
-	if err != nil || state.Stage != unlock.StageAwaitingVoucher {
-		t.Fatalf("got %+v, %v", state, err)
-	}
-	if _, err := f.svc.Confirm(f.ctx, sessionID, f.client, true); err == nil {
-		t.Fatal("confirm must not be possible before a voucher signs in")
-	}
-}
-
 func TestProtectedTargetIsIneligible(t *testing.T) {
 	f := newFixture(t)
 	f.dir.Lock("root")
-	_, sessionID, err := f.svc.Claim(f.ctx, f.client, "root", "root-password")
-	if err != nil {
-		t.Fatal(err)
-	}
-	state, err := f.svc.Vouch(f.ctx, sessionID, f.client, "bob", bobPass)
+	sessionID := f.start(t)
+	state, err := f.svc.Claim(f.ctx, sessionID, f.client, "root", "root-password")
 	if err != nil || state.Outcome != unlock.OutcomeIneligible {
 		t.Fatalf("got %+v, %v", state, err)
 	}
@@ -226,13 +234,58 @@ func TestProtectedTargetIsIneligible(t *testing.T) {
 
 func TestEligibleGroups(t *testing.T) {
 	f := newFixture(t, func(p *unlock.Policy) { p.EligibleGroups = []string{"CN=Nobody,DC=example,DC=test"} })
-	_, sessionID, err := f.svc.Claim(f.ctx, f.client, "alice", alicePass)
-	if err != nil {
-		t.Fatal(err)
-	}
-	state, err := f.svc.Vouch(f.ctx, sessionID, f.client, "bob", bobPass)
+	sessionID := f.start(t)
+	state, err := f.svc.Claim(f.ctx, sessionID, f.client, "alice", alicePass)
 	if err != nil || state.Outcome != unlock.OutcomeIneligible {
 		t.Fatalf("got %+v, %v", state, err)
+	}
+}
+
+func TestDisabledTargetIsIneligible(t *testing.T) {
+	f := newFixture(t)
+	f.dir.Get("alice").User.UserAccountControl |= 0x2
+	sessionID := f.start(t)
+	state, err := f.svc.Claim(f.ctx, sessionID, f.client, "alice", alicePass)
+	if err != nil || state.Outcome != unlock.OutcomeIneligible {
+		t.Fatalf("got %+v, %v", state, err)
+	}
+}
+
+func TestConfirmRequiresTheSameVoucher(t *testing.T) {
+	f := newFixture(t)
+	sessionID := f.startAndClaim(t, alicePass)
+
+	_, err := f.svc.Confirm(f.ctx, sessionID, f.client, "bob", bobPass, false)
+	wantCode(t, err, unlock.CodeAttestationRequired)
+
+	// dave is a voucher too, but didn't start this session. His password is never tried.
+	_, err = f.svc.Confirm(f.ctx, sessionID, f.client, "dave", "dave-password", true)
+	wantCode(t, err, unlock.CodeVoucherMismatch)
+	if f.dir.Binds["dave"] != 0 {
+		t.Fatal("a mismatched voucher's password must not be tried")
+	}
+
+	_, err = f.svc.Confirm(f.ctx, sessionID, f.client, "bob", "wrong", true)
+	wantCode(t, err, unlock.CodeInvalidCredentials)
+	if f.dir.Unlocks != 0 {
+		t.Fatal("must not unlock before the voucher re-authenticates")
+	}
+
+	// bob can retry, and may give his UPN instead.
+	state, err := f.svc.Confirm(f.ctx, sessionID, f.client, "bob@example.test", bobPass, true)
+	if err != nil || state.Outcome != unlock.OutcomeUnlocked {
+		t.Fatalf("got %+v, %v", state, err)
+	}
+}
+
+func TestConfirmRechecksVoucherGroups(t *testing.T) {
+	f := newFixture(t)
+	sessionID := f.startAndClaim(t, alicePass)
+	f.dir.Get("bob").Groups = nil
+	_, err := f.confirm(sessionID)
+	wantCode(t, err, unlock.CodeVoucherNotAuthorised)
+	if f.dir.Unlocks != 0 {
+		t.Fatal("must not unlock for a voucher who lost their rights")
 	}
 }
 
@@ -244,26 +297,20 @@ func TestPresenceEnforcement(t *testing.T) {
 	for name, other := range cases {
 		t.Run(name, func(t *testing.T) {
 			f := newFixture(t)
-			_, sessionID, err := f.svc.Claim(f.ctx, f.client, "alice", alicePass)
-			if err != nil {
-				t.Fatal(err)
-			}
-			_, err = f.svc.Vouch(f.ctx, sessionID, other, "bob", bobPass)
+			sessionID := f.start(t)
+			_, err := f.svc.Claim(f.ctx, sessionID, other, "alice", alicePass)
 			wantCode(t, err, unlock.CodePresenceMismatch)
 			// The session is destroyed, even for the original browser.
-			_, err = f.svc.Vouch(f.ctx, sessionID, f.client, "bob", bobPass)
+			_, err = f.svc.Claim(f.ctx, sessionID, f.client, "alice", alicePass)
 			wantCode(t, err, unlock.CodeNoSession)
 		})
 	}
 
 	t.Run("address change allowed by policy", func(t *testing.T) {
 		f := newFixture(t, func(p *unlock.Policy) { p.AllowClientIPChange = true })
-		_, sessionID, err := f.svc.Claim(f.ctx, f.client, "alice", alicePass)
-		if err != nil {
-			t.Fatal(err)
-		}
+		sessionID := f.start(t)
 		moved := unlock.Client{IP: "198.51.100.7", UserAgent: f.client.UserAgent}
-		if _, err := f.svc.Vouch(f.ctx, sessionID, moved, "bob", bobPass); err != nil {
+		if _, err := f.svc.Claim(f.ctx, sessionID, moved, "alice", alicePass); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -271,12 +318,9 @@ func TestPresenceEnforcement(t *testing.T) {
 
 func TestSessionExpiry(t *testing.T) {
 	f := newFixture(t)
-	_, sessionID, err := f.svc.Claim(f.ctx, f.client, "alice", alicePass)
-	if err != nil {
-		t.Fatal(err)
-	}
+	sessionID := f.start(t)
 	f.clock.Advance(unlock.DefaultSessionLifetime)
-	_, err = f.svc.Vouch(f.ctx, sessionID, f.client, "bob", bobPass)
+	_, err := f.svc.Claim(f.ctx, sessionID, f.client, "alice", alicePass)
 	wantCode(t, err, unlock.CodeSessionExpired)
 	state, err := f.svc.State(f.ctx, sessionID, f.client)
 	if err != nil || state.Stage != unlock.StageStart {
@@ -286,92 +330,75 @@ func TestSessionExpiry(t *testing.T) {
 
 func TestConfirmWindow(t *testing.T) {
 	f := newFixture(t)
-	sessionID := f.claimAndVouch(t, alicePass)
+	sessionID := f.startAndClaim(t, alicePass)
 	f.clock.Advance(unlock.DefaultConfirmWindow)
-	_, err := f.svc.Confirm(f.ctx, sessionID, f.client, true)
+	_, err := f.confirm(sessionID)
 	wantCode(t, err, unlock.CodeSessionExpired)
 
-	// The voucher has to sign in again.
+	// The user has to enter their details again; the voucher stays signed in.
 	state, err := f.svc.State(f.ctx, sessionID, f.client)
-	if err != nil || state.Stage != unlock.StageAwaitingVoucher || state.Voucher != nil {
+	if err != nil || state.Stage != unlock.StageAwaitingClaim || state.Target != nil || state.Voucher == nil {
 		t.Fatalf("got %+v, %v", state, err)
 	}
-	if _, err := f.svc.Vouch(f.ctx, sessionID, f.client, "bob", bobPass); err != nil {
+	if _, err := f.svc.Claim(f.ctx, sessionID, f.client, "alice", alicePass); err != nil {
 		t.Fatal(err)
 	}
-	if state, err := f.svc.Confirm(f.ctx, sessionID, f.client, true); err != nil || state.Outcome != unlock.OutcomeUnlocked {
+	if state, err := f.confirm(sessionID); err != nil || state.Outcome != unlock.OutcomeUnlocked {
 		t.Fatalf("got %+v, %v", state, err)
 	}
 }
 
-func TestAttestationRequired(t *testing.T) {
-	f := newFixture(t)
-	sessionID := f.claimAndVouch(t, alicePass)
-	_, err := f.svc.Confirm(f.ctx, sessionID, f.client, false)
-	wantCode(t, err, unlock.CodeAttestationRequired)
-	if f.dir.Unlocks != 0 {
-		t.Fatal("must not unlock without attestation")
-	}
-}
-
-func TestTargetChangedBeforeVouch(t *testing.T) {
-	f := newFixture(t)
-	_, sessionID, err := f.svc.Claim(f.ctx, f.client, "alice", alicePass)
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.dir.Get("alice").User.UserAccountControl |= 0x2
-	state, err := f.svc.Vouch(f.ctx, sessionID, f.client, "bob", bobPass)
-	if err != nil || state.Outcome != unlock.OutcomeIneligible {
-		t.Fatalf("disabled since claim: got %+v, %v", state, err)
-	}
-}
-
-func TestRateLimit(t *testing.T) {
+func TestRateLimitCountsFailuresOnly(t *testing.T) {
 	f := newFixture(t, func(p *unlock.Policy) { p.RateLimit = unlock.RateLimitConfig{Attempts: 2, Window: time.Minute} })
+
+	// Successful unlocks don't count, so a service desk machine can do many in a row.
+	for range 4 {
+		f.dir.Lock("alice")
+		sessionID := f.startAndClaim(t, alicePass)
+		if state, err := f.confirm(sessionID); err != nil || state.Outcome != unlock.OutcomeUnlocked {
+			t.Fatalf("got %+v, %v", state, err)
+		}
+	}
+
+	sessionID := f.start(t)
 	for range 2 {
-		_, _, err := f.svc.Claim(f.ctx, f.client, "carol", "wrong")
+		_, err := f.svc.Claim(f.ctx, sessionID, f.client, "carol", "wrong")
 		wantCode(t, err, unlock.CodeInvalidCredentials)
 	}
-	_, _, err := f.svc.Claim(f.ctx, f.client, "carol", "carol-password")
+	_, err := f.svc.Claim(f.ctx, sessionID, f.client, "carol", "carol-password")
 	wantCode(t, err, unlock.CodeRateLimited)
 	if f.dir.Binds["carol"] != 2 {
 		t.Fatalf("rate-limited attempts must not reach the directory: %d binds", f.dir.Binds["carol"])
 	}
 
-	// A different address is still limited by username.
-	other := unlock.Client{IP: "198.51.100.7", UserAgent: "x"}
-	_, _, err = f.svc.Claim(f.ctx, other, "carol", "carol-password")
-	wantCode(t, err, unlock.CodeRateLimited)
-
-	// Naming the account differently doesn't get round the limit.
-	third := unlock.Client{IP: "203.0.113.9", UserAgent: "x"}
-	_, _, err = f.svc.Claim(f.ctx, third, "carol@example.test", "carol-password")
+	// Another machine is still limited by the account, however it is named.
+	other := fixture{dir: f.dir, svc: f.svc, clock: f.clock, ctx: f.ctx,
+		client: unlock.Client{IP: "198.51.100.7", UserAgent: "x"}}
+	_, otherSession, err := f.svc.StartVouch(f.ctx, other.client, "bob", bobPass)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.svc.Claim(f.ctx, otherSession, other.client, "carol@example.test", "carol-password")
 	wantCode(t, err, unlock.CodeRateLimited)
 
 	f.clock.Advance(time.Minute + time.Second)
-	if _, _, err := f.svc.Claim(f.ctx, f.client, "carol", "carol-password"); err != nil {
-		t.Fatalf("limit should reset after the window: %v", err)
+	if state, err := f.svc.Claim(f.ctx, sessionID, f.client, "carol", "carol-password"); err != nil ||
+		state.Outcome != unlock.OutcomeNotLocked {
+		t.Fatalf("limit should reset after the window: %+v, %v", state, err)
 	}
 }
 
 func TestCancelAndSweep(t *testing.T) {
 	f := newFixture(t)
-	_, sessionID, err := f.svc.Claim(f.ctx, f.client, "alice", alicePass)
-	if err != nil {
-		t.Fatal(err)
-	}
+	sessionID := f.start(t)
 	f.svc.Cancel(f.ctx, sessionID)
-	_, err = f.svc.Vouch(f.ctx, sessionID, f.client, "bob", bobPass)
+	_, err := f.svc.Claim(f.ctx, sessionID, f.client, "alice", alicePass)
 	wantCode(t, err, unlock.CodeNoSession)
 
-	_, sessionID, err = f.svc.Claim(f.ctx, f.client, "alice", alicePass)
-	if err != nil {
-		t.Fatal(err)
-	}
+	sessionID = f.start(t)
 	f.clock.Advance(unlock.DefaultSessionLifetime)
 	f.svc.Sweep()
-	_, err = f.svc.Vouch(f.ctx, sessionID, f.client, "bob", bobPass)
+	_, err = f.svc.Claim(f.ctx, sessionID, f.client, "alice", alicePass)
 	wantCode(t, err, unlock.CodeNoSession)
 }
 

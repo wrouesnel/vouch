@@ -2,12 +2,14 @@
 //
 // The workflow has three steps, all made from one browser session:
 //
-//  1. Claim: the locked-out user gives their username and password. If binding as them says
-//     the account is locked, a session is started holding the password in memory.
-//  2. Vouch: a colleague signs in on the same browser. They must be in a voucher group, must
-//     not be the claimant, and the claimant must be eligible for self-service unlock.
-//  3. Confirm: the colleague attests they are with the user in person. The account is
-//     unlocked and the password from step 1 is verified by binding as the user.
+//  1. Voucher: an authorised colleague signs in. They must be in a voucher group. This starts
+//     the session, bound to their browser.
+//  2. Claim: the locked-out user gives their username and password in that session. If binding
+//     as them says the account is locked, and it is eligible for self-service unlock, the
+//     password is held in memory and the user's details are shown to the voucher.
+//  3. Confirm: the voucher attests they are with the user in person and re-enters their own
+//     credentials. The account is unlocked and the password from step 2 is verified by binding
+//     as the user.
 //
 // AD won't say whether a password is right while the account is locked, so the password can
 // only be verified after the unlock, in step 3.
@@ -46,11 +48,11 @@ type Policy struct {
 	// EligibleGroups, if set, limits unlocking to members of these groups.
 	EligibleGroups []string `yaml:"eligibleGroups"`
 	// DisableOnFailedVerification disables an account if, after it was unlocked, the password
-	// given in step 1 turns out to be wrong.
+	// given in step 2 turns out to be wrong.
 	DisableOnFailedVerification bool `yaml:"disableOnFailedVerification"`
-	// SessionLifetime is how long the whole workflow may take from step 1.
+	// SessionLifetime is how long the whole workflow may take from the voucher signing in.
 	SessionLifetime time.Duration `yaml:"sessionLifetime"`
-	// ConfirmWindow is how long the voucher has to confirm after signing in.
+	// ConfirmWindow is how long the voucher has to confirm after the user enters their details.
 	ConfirmWindow time.Duration `yaml:"confirmWindow"`
 	// AllowClientIPChange lets a session continue from a different client address. Leave it
 	// off unless clients' addresses legitimately change mid-session.
@@ -65,7 +67,7 @@ type Stage string
 // Stages. These match the API.
 const (
 	StageStart                Stage = "start"
-	StageAwaitingVoucher      Stage = "awaiting_voucher"
+	StageAwaitingClaim        Stage = "awaiting_claim"
 	StageAwaitingConfirmation Stage = "awaiting_confirmation"
 	StageComplete             Stage = "complete"
 )
@@ -111,7 +113,7 @@ type session struct {
 	stage           Stage
 	claimedUsername string
 	target          *directory.User
-	// password is the claimant's password, held until step 3 and then wiped.
+	// password is the claimant's password, held from step 2 until step 3 and then wiped.
 	password  []byte
 	voucher   *directory.User
 	confirmBy time.Time
@@ -128,11 +130,7 @@ func (s *session) state() State {
 		Message:         s.message,
 		ExpiresAt:       s.expiresAt,
 		Voucher:         s.voucher,
-	}
-	// The claimant's directory details are only shown once a voucher has signed in, so the
-	// first step doesn't reveal anything about an account to whoever typed its name.
-	if s.voucher != nil {
-		state.Target = s.target
+		Target:          s.target,
 	}
 	if s.stage == StageAwaitingConfirmation {
 		state.ConfirmBy = s.confirmBy
@@ -146,6 +144,15 @@ func (s *session) wipe() {
 		s.password[i] = 0
 	}
 	s.password = nil
+}
+
+// dropClaim discards the claimant so they must enter their details again. mu must be held.
+func (s *session) dropClaim() {
+	s.wipe()
+	s.stage = StageAwaitingClaim
+	s.claimedUsername = ""
+	s.target = nil
+	s.confirmBy = time.Time{}
 }
 
 // finish moves the session to complete. mu must be held.
@@ -253,10 +260,17 @@ func randomID(size int) string {
 
 // auditLog returns the audit logger for a session.
 func auditLog(ctx context.Context, sess *session) *zap.Logger {
-	return logutil.FromCtx(ctx).Named("audit").With(
+	fields := []zap.Field{
 		zap.String("audit_id", sess.auditID),
 		zap.String("client_ip", sess.client.IP),
-		zap.String("claimed_username", sess.claimedUsername))
+	}
+	if sess.voucher != nil {
+		fields = append(fields, zap.String("voucher_dn", sess.voucher.DN))
+	}
+	if sess.target != nil {
+		fields = append(fields, zap.String("target_dn", sess.target.DN))
+	}
+	return logutil.FromCtx(ctx).Named("audit").With(fields...)
 }
 
 // remove deletes a session and wipes it.
@@ -338,84 +352,81 @@ func (s *Service) Cancel(ctx context.Context, sessionID string) {
 	}
 }
 
-// Claim is step 1. If the account is locked it starts a session and returns its ID. If the
-// password works the account isn't locked, and no session is started.
-func (s *Service) Claim(ctx context.Context, client Client, username, password string) (State, string, error) {
+// authenticateVoucher looks up and binds as a voucher, and checks they are in a voucher group.
+// log must already identify the session.
+func (s *Service) authenticateVoucher(ctx context.Context, log *zap.Logger, client Client,
+	username, password string,
+) (*directory.User, error) {
+	keys := rateKeys(client, username)
+	if !s.limiter.Allowed(keys...) {
+		log.Warn("Voucher rate limited", zap.String("voucher_username", username))
+		return nil, errRateLimited()
+	}
+	voucher, err := s.dir.LookupUser(ctx, username)
+	if errors.Is(err, directory.ErrUserNotFound) {
+		log.Info("Voucher rejected: unknown user", zap.String("voucher_username", username))
+		s.limiter.Fail(keys...)
+		return nil, errInvalidCredentials()
+	}
+	if err != nil {
+		log.Error("Voucher failed: directory lookup error", zap.Error(err))
+		return nil, directoryError(err)
+	}
+	log = log.With(zap.String("voucher_username", voucher.SAMAccountName), zap.String("voucher_dn", voucher.DN))
+	keys = append(keys, dnRateKey(voucher))
+	if !s.limiter.Allowed(keys...) {
+		log.Warn("Voucher rate limited")
+		return nil, errRateLimited()
+	}
+
+	result, err := s.dir.Authenticate(ctx, voucher, []byte(password))
+	if err != nil {
+		log.Error("Voucher failed: directory bind error", zap.Error(err))
+		return nil, directoryError(err)
+	}
+	if result != directory.BindOK {
+		log.Info("Voucher rejected: sign-in failed", zap.String("bind_result", result.String()))
+		s.limiter.Fail(keys...)
+		return nil, errInvalidCredentials()
+	}
+
+	authorised, err := s.dir.IsMemberOfAny(ctx, voucher, s.policy.VoucherGroups)
+	if err != nil {
+		log.Error("Voucher failed: group membership lookup error", zap.Error(err))
+		return nil, directoryError(err)
+	}
+	if !authorised {
+		log.Warn("Voucher rejected: not in a voucher group")
+		s.limiter.Fail(keys...)
+		return nil, newError(CodeVoucherNotAuthorised, "Your account isn't allowed to vouch for other users.")
+	}
+	return voucher, nil
+}
+
+// StartVouch is step 1: an authorised colleague signs in, which starts a session. It returns
+// the new session's ID.
+func (s *Service) StartVouch(ctx context.Context, client Client, username, password string) (State, string, error) {
 	username = directory.NormaliseUsername(username)
 	if username == "" || password == "" {
-		return State{}, "", newError(CodeBadRequest, "Enter your username and password.")
+		return State{Stage: StageStart}, "", newError(CodeBadRequest, "Enter your username and password.")
 	}
-	if !s.limiter.Allow(rateKeys(client, username)...) {
-		logutil.FromCtx(ctx).Named("audit").Warn("Claim rate limited",
-			zap.String("client_ip", client.IP), zap.String("claimed_username", username))
-		return State{}, "", errRateLimited()
-	}
-
 	sess := &session{
-		auditID:         randomID(9),
-		client:          client,
-		claimedUsername: username,
-		stage:           StageAwaitingVoucher,
-		expiresAt:       s.now().Add(s.policy.SessionLifetime),
+		auditID:   randomID(9),
+		client:    client,
+		stage:     StageAwaitingClaim,
+		expiresAt: s.now().Add(s.policy.SessionLifetime),
 	}
-	log := auditLog(ctx, sess)
-
-	user, err := s.dir.LookupUser(ctx, username)
-	if errors.Is(err, directory.ErrUserNotFound) {
-		log.Info("Claim rejected: unknown user")
-		return State{}, "", errInvalidCredentials()
-	}
+	voucher, err := s.authenticateVoucher(ctx, auditLog(ctx, sess), client, username, password)
 	if err != nil {
-		log.Error("Claim failed: directory lookup error", zap.Error(err))
-		return State{}, "", directoryError(err)
+		return State{Stage: StageStart}, "", err
 	}
+	sess.voucher = voucher
 
-	// The same account can be named several ways, so limit by the account too.
-	if !s.limiter.Allow(dnRateKey(user)) {
-		log.Warn("Claim rate limited", zap.String("target_dn", user.DN))
-		return State{}, "", errRateLimited()
-	}
-
-	result, err := s.dir.Authenticate(ctx, user, []byte(password))
-	if err != nil {
-		log.Error("Claim failed: directory bind error", zap.Error(err))
-		return State{}, "", directoryError(err)
-	}
-	log = log.With(zap.String("target_dn", user.DN), zap.String("bind_result", result.String()))
-
-	switch result {
-	case directory.BindOK:
-		log.Info("Claim: account is not locked")
-		return State{
-			Stage:           StageComplete,
-			ClaimedUsername: username,
-			Outcome:         OutcomeNotLocked,
-			Message:         "Your password works and your account isn't locked. You can sign in normally.",
-		}, "", nil
-	case directory.BindLockedOut:
-		// Handled below.
-	case directory.BindInvalidCredentials:
-		log.Info("Claim rejected: invalid credentials")
-		return State{}, "", errInvalidCredentials()
-	case directory.BindPasswordExpired:
-		log.Info("Claim rejected: password expired")
-		return State{}, "", newError(CodeAccountRestricted,
-			"Your account isn't locked, but your password has expired. Change it the usual way, "+
-				"or contact the service desk.")
-	default:
-		log.Info("Claim rejected: account restricted")
-		return State{}, "", newError(CodeAccountRestricted,
-			"This account can't be unlocked here. Please contact the service desk.")
-	}
-
-	sess.target = user
-	sess.password = []byte(password)
 	sessionID := randomID(32)
 	s.mu.Lock()
 	s.sessions[sessionID] = sess
 	s.mu.Unlock()
-	log.Info("Claim accepted: account is locked, waiting for a voucher",
-		zap.Time("lockout_time", user.LockoutTime))
+	auditLog(ctx, sess).Info("Voucher signed in, waiting for the locked-out user")
 
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
@@ -446,14 +457,15 @@ func (s *Service) checkEligible(ctx context.Context, target *directory.User) (st
 	return "", nil
 }
 
-// Vouch is step 2: a colleague signs in to vouch for the claimant.
-func (s *Service) Vouch(ctx context.Context, sessionID string, client Client, username, password string) (State, error) {
+// Claim is step 2: the locked-out user enters their username and password. If the password
+// works the account isn't locked, and the session completes.
+func (s *Service) Claim(ctx context.Context, sessionID string, client Client, username, password string) (State, error) {
 	sess, err := s.acquire(ctx, sessionID, client)
 	if err != nil {
 		return State{Stage: StageStart}, err
 	}
 	defer sess.mu.Unlock()
-	if sess.stage != StageAwaitingVoucher {
+	if sess.stage != StageAwaitingClaim {
 		return sess.state(), errWrongStage()
 	}
 
@@ -461,78 +473,76 @@ func (s *Service) Vouch(ctx context.Context, sessionID string, client Client, us
 	if username == "" || password == "" {
 		return sess.state(), newError(CodeBadRequest, "Enter your username and password.")
 	}
-	log := auditLog(ctx, sess).With(zap.String("voucher_username", username))
-	if !s.limiter.Allow(rateKeys(client, username)...) {
-		log.Warn("Voucher rate limited")
+	log := auditLog(ctx, sess).With(zap.String("claimed_username", username))
+	keys := rateKeys(client, username)
+	if !s.limiter.Allowed(keys...) {
+		log.Warn("Claim rate limited")
 		return sess.state(), errRateLimited()
 	}
 
-	voucher, err := s.dir.LookupUser(ctx, username)
+	user, err := s.dir.LookupUser(ctx, username)
 	if errors.Is(err, directory.ErrUserNotFound) {
-		log.Info("Voucher rejected: unknown user")
+		log.Info("Claim rejected: unknown user")
+		s.limiter.Fail(keys...)
 		return sess.state(), errInvalidCredentials()
 	}
 	if err != nil {
-		log.Error("Voucher failed: directory lookup error", zap.Error(err))
+		log.Error("Claim failed: directory lookup error", zap.Error(err))
 		return sess.state(), directoryError(err)
 	}
-	log = log.With(zap.String("voucher_dn", voucher.DN))
+	log = log.With(zap.String("target_dn", user.DN))
 
-	if voucher.SameAs(sess.target) {
-		log.Warn("Voucher rejected: claimant tried to vouch for themselves")
+	if user.SameAs(sess.voucher) {
+		log.Warn("Claim rejected: voucher tried to vouch for themselves")
 		return sess.state(), newError(CodeVoucherIsClaimant,
-			"You can't vouch for yourself. A colleague must sign in here.")
+			"You can't vouch for yourself. The locked-out user must enter their own details.")
 	}
-
-	if !s.limiter.Allow(dnRateKey(voucher)) {
-		log.Warn("Voucher rate limited")
+	// The same account can be named several ways, so limit by the account too.
+	keys = append(keys, dnRateKey(user))
+	if !s.limiter.Allowed(keys...) {
+		log.Warn("Claim rate limited")
 		return sess.state(), errRateLimited()
 	}
 
-	result, err := s.dir.Authenticate(ctx, voucher, []byte(password))
+	result, err := s.dir.Authenticate(ctx, user, []byte(password))
 	if err != nil {
-		log.Error("Voucher failed: directory bind error", zap.Error(err))
+		log.Error("Claim failed: directory bind error", zap.Error(err))
 		return sess.state(), directoryError(err)
 	}
-	if result != directory.BindOK {
-		log.Info("Voucher rejected: sign-in failed", zap.String("bind_result", result.String()))
+	log = log.With(zap.String("bind_result", result.String()))
+
+	switch result {
+	case directory.BindOK:
+		log.Info("Claim: account is not locked")
+		sess.claimedUsername = username
+		sess.target = user
+		sess.finish(OutcomeNotLocked, "This account's password works and it isn't locked. "+
+			"The user can sign in normally.")
+		return sess.state(), nil
+	case directory.BindLockedOut:
+		// Handled below.
+	case directory.BindInvalidCredentials:
+		log.Info("Claim rejected: invalid credentials")
+		s.limiter.Fail(keys...)
 		return sess.state(), errInvalidCredentials()
+	case directory.BindPasswordExpired:
+		log.Info("Claim rejected: password expired")
+		return sess.state(), newError(CodeAccountRestricted,
+			"This account isn't locked, but its password has expired. Change it the usual way, "+
+				"or contact the service desk.")
+	default:
+		log.Info("Claim rejected: account restricted")
+		return sess.state(), newError(CodeAccountRestricted,
+			"This account can't be unlocked here. Please contact the service desk.")
 	}
 
-	authorised, err := s.dir.IsMemberOfAny(ctx, voucher, s.policy.VoucherGroups)
+	sess.claimedUsername = username
+	sess.target = user
+	reason, err := s.checkEligible(ctx, user)
 	if err != nil {
-		log.Error("Voucher failed: group membership lookup error", zap.Error(err))
-		return sess.state(), directoryError(err)
-	}
-	if !authorised {
-		log.Warn("Voucher rejected: not in a voucher group")
-		return sess.state(), newError(CodeVoucherNotAuthorised,
-			"Your account isn't allowed to vouch for other users.")
-	}
-
-	// Re-read the target so the checks and the details shown to the voucher are current.
-	target, err := s.dir.LookupDN(ctx, sess.target.DN)
-	if errors.Is(err, directory.ErrUserNotFound) {
-		log.Warn("Target disappeared since the claim")
-		sess.finish(OutcomeIneligible, "This account changed while the request was in progress. Please start again.")
-		return sess.state(), nil
-	}
-	if err != nil {
-		log.Error("Voucher failed: target lookup error", zap.Error(err))
-		return sess.state(), directoryError(err)
-	}
-	if !target.SameAs(sess.target) {
-		log.Error("Voucher failed: target changed identity since the claim")
-		sess.finish(OutcomeIneligible, "This account changed while the request was in progress. Please start again.")
-		return sess.state(), nil
-	}
-	sess.target = target
-	sess.voucher = voucher
-
-	reason, err := s.checkEligible(ctx, target)
-	if err != nil {
-		log.Error("Voucher failed: eligibility lookup error", zap.Error(err))
-		sess.voucher = nil
+		log.Error("Claim failed: eligibility lookup error", zap.Error(err))
+		sess.target = nil
+		sess.claimedUsername = ""
 		return sess.state(), directoryError(err)
 	}
 	if reason != "" {
@@ -541,18 +551,22 @@ func (s *Service) Vouch(ctx context.Context, sessionID string, client Client, us
 		return sess.state(), nil
 	}
 
+	sess.password = []byte(password)
 	sess.stage = StageAwaitingConfirmation
 	sess.confirmBy = s.now().Add(s.policy.ConfirmWindow)
 	if sess.confirmBy.After(sess.expiresAt) {
 		sess.confirmBy = sess.expiresAt
 	}
-	log.Info("Voucher accepted, waiting for confirmation")
+	log.Info("Claim accepted: account is locked, waiting for the voucher to confirm",
+		zap.Time("lockout_time", user.LockoutTime))
 	return sess.state(), nil
 }
 
-// Confirm is step 3: the voucher attests to the claimant's identity, the account is unlocked,
-// and the claimant's password is verified.
-func (s *Service) Confirm(ctx context.Context, sessionID string, client Client, attest bool) (State, error) {
+// Confirm is step 3: the voucher attests to the claimant's identity and re-enters their own
+// credentials. The account is unlocked and the claimant's password is verified.
+func (s *Service) Confirm(ctx context.Context, sessionID string, client Client,
+	username, password string, attest bool,
+) (State, error) {
 	sess, err := s.acquire(ctx, sessionID, client)
 	if err != nil {
 		return State{Stage: StageStart}, err
@@ -561,19 +575,38 @@ func (s *Service) Confirm(ctx context.Context, sessionID string, client Client, 
 	if sess.stage != StageAwaitingConfirmation {
 		return sess.state(), errWrongStage()
 	}
-	log := auditLog(ctx, sess).With(
-		zap.String("target_dn", sess.target.DN), zap.String("voucher_dn", sess.voucher.DN))
+	log := auditLog(ctx, sess)
 
 	if !s.now().Before(sess.confirmBy) {
-		log.Info("Confirmation window expired, voucher must sign in again")
-		sess.stage = StageAwaitingVoucher
-		sess.voucher = nil
+		log.Info("Confirmation window expired, the user must enter their details again")
+		sess.dropClaim()
 		return sess.state(), newError(CodeSessionExpired,
-			"The voucher's sign-in has expired. Please sign in again to vouch.")
+			"Too much time has passed. The locked-out user must enter their details again.")
 	}
 	if !attest {
 		return sess.state(), newError(CodeAttestationRequired,
 			"Confirm that you are with this person and have checked their identity.")
+	}
+	username = directory.NormaliseUsername(username)
+	if username == "" || password == "" {
+		return sess.state(), newError(CodeBadRequest, "Enter your username and password to confirm.")
+	}
+
+	// Check the name before binding, so a different account's password is never tried.
+	if !strings.EqualFold(username, sess.voucher.SAMAccountName) &&
+		!strings.EqualFold(username, sess.voucher.UserPrincipalName) {
+		log.Warn("Confirmation rejected: a different voucher tried to confirm",
+			zap.String("confirming_username", username))
+		return sess.state(), errVoucherMismatch(sess.voucher)
+	}
+	voucher, err := s.authenticateVoucher(ctx, log, client, username, password)
+	if err != nil {
+		return sess.state(), err
+	}
+	if !voucher.SameAs(sess.voucher) {
+		log.Warn("Confirmation rejected: signed in as a different voucher",
+			zap.String("confirming_voucher_dn", voucher.DN))
+		return sess.state(), errVoucherMismatch(sess.voucher)
 	}
 
 	result, err := s.dir.UnlockAndVerify(ctx, sess.target, sess.password)
@@ -587,18 +620,19 @@ func (s *Service) Confirm(ctx context.Context, sessionID string, client Client, 
 
 	if result == directory.BindOK {
 		log.Info("Account unlocked and password verified")
-		sess.finish(OutcomeUnlocked, "The account is unlocked. You can sign in now.")
+		sess.finish(OutcomeUnlocked, "The account is unlocked. The user can sign in now.")
 		return sess.state(), nil
 	}
 
-	message := "The account was unlocked, but the password entered in the first step was wrong. " +
-		"If you've forgotten your password, contact the service desk to reset it."
+	s.limiter.Fail("ip:"+client.IP, dnRateKey(sess.target))
+	message := "The account was unlocked, but the password the user entered was wrong. " +
+		"If they've forgotten their password, contact the service desk to reset it."
 	if s.policy.DisableOnFailedVerification {
 		if err := s.dir.Disable(ctx, sess.target); err != nil {
 			log.Error("Password verification failed after unlock, and disabling the account failed", zap.Error(err))
 		} else {
 			log.Warn("Password verification failed after unlock: account disabled")
-			message = "The password entered in the first step was wrong, so the account has been disabled. " +
+			message = "The password the user entered was wrong, so the account has been disabled. " +
 				"Contact the service desk."
 		}
 	} else {

@@ -30,7 +30,7 @@ const steps = document.getElementById("steps") as HTMLOListElement;
 const title = document.getElementById("title") as HTMLHeadingElement;
 
 let info: Info = {
-  title: "Unlock your account",
+  title: "Account unlock",
   voucherDescription: "an authorised colleague",
   sessionLifetimeSeconds: 300,
   confirmWindowSeconds: 120,
@@ -78,8 +78,8 @@ function field(id: string, label: string, input: HTMLInputElement): HTMLElement 
   return h("div", { class: "field" }, h("label", { for: id }, label), input);
 }
 
-function setSteps(active: "claim" | "vouch" | "confirm" | "done"): void {
-  const order = ["claim", "vouch", "confirm"];
+function setSteps(active: "vouch" | "claim" | "confirm" | "done"): void {
+  const order = ["vouch", "claim", "confirm"];
   const activeIdx = active === "done" ? order.length : order.indexOf(active);
   for (const li of Array.from(steps.children) as HTMLElement[]) {
     const idx = order.indexOf(li.dataset.step ?? "");
@@ -124,7 +124,7 @@ async function cancel(): Promise<void> {
   try {
     await api.cancel();
   } finally {
-    showClaim();
+    showVoucher();
   }
 }
 
@@ -150,67 +150,30 @@ function accountDetails(account: Account): HTMLElement {
 
 // --- Views ----------------------------------------------------------------------------------
 
-function showClaim(error?: string, username = ""): void {
-  setSteps("claim");
-  const usernameInput = h("input", {
-    type: "text", name: "username", autocomplete: "username", autocapitalize: "none",
-    spellcheck: "false", required: true, maxlength: "256", value: username, autofocus: !username,
+/** credentialInputs makes username and password fields the browser is asked not to remember:
+ * every step may happen on a computer that belongs to someone else. */
+function credentialInputs(prefix: string): [HTMLInputElement, HTMLInputElement] {
+  const noSave = { autocomplete: "off", "data-lpignore": "true", "data-1p-ignore": "true" };
+  const username = h("input", {
+    type: "text", name: `${prefix}-username`, autocapitalize: "none", spellcheck: "false",
+    required: true, maxlength: "256", ...noSave,
   });
-  const passwordInput = h("input", {
-    type: "password", name: "password", autocomplete: "current-password", required: true,
-    maxlength: "1024", autofocus: !!username,
+  const password = h("input", {
+    type: "password", name: `${prefix}-password`, required: true, maxlength: "1024", ...noSave,
   });
-  const form = h(
-    "form",
-    {},
-    field("claim-username", "Username", usernameInput),
-    field("claim-password", "Password", passwordInput),
-    h("div", { class: "actions" }, h("button", { type: "submit" }, "Continue")),
-  );
-  form.addEventListener("submit", (ev) => {
-    ev.preventDefault();
-    const user = usernameInput.value;
-    const pass = passwordInput.value;
-    passwordInput.value = "";
-    void submitting(form, () => api.claim(user, pass))
-      .then(show)
-      .catch((err) => handleError(err, (message) => showClaim(message, user)));
-  });
-  render(
-    h("h2", { tabindex: "-1" }, "Locked out?"),
-    h(
-      "p",
-      {},
-      "Enter your username and your current password. Then ",
-      h("strong", {}, info.voucherDescription),
-      " signs in on this same screen to confirm who you are, and your account is unlocked.",
-    ),
-    info.helpText ? h("p", { class: "muted" }, info.helpText) : null,
-    alertBox(error),
-    form,
-    h("p", { class: "muted small" }, "Forgotten your password? This page can't reset it. Contact the service desk instead."),
-  );
+  return [username, password];
 }
 
-function showVoucher(state: SessionState, error?: string): void {
+function showVoucher(error?: string): void {
   setSteps("vouch");
-  // The voucher is signing in on someone else's computer. Ask the browser not to remember
-  // their credentials.
-  const usernameInput = h("input", {
-    type: "text", name: "voucher-username", autocomplete: "off", autocapitalize: "none",
-    spellcheck: "false", required: true, maxlength: "256", autofocus: true,
-    "data-lpignore": "true", "data-1p-ignore": "true",
-  });
-  const passwordInput = h("input", {
-    type: "password", name: "voucher-password", autocomplete: "off", required: true, maxlength: "1024",
-    "data-lpignore": "true", "data-1p-ignore": "true",
-  });
+  const [usernameInput, passwordInput] = credentialInputs("voucher");
+  usernameInput.autofocus = true;
   const form = h(
     "form",
     { autocomplete: "off" },
-    field("voucher-username", "Colleague's username", usernameInput),
-    field("voucher-password", "Colleague's password", passwordInput),
-    h("div", { class: "actions" }, h("button", { type: "submit" }, "Sign in to vouch"), cancelButton()),
+    field("voucher-username", "Your username", usernameInput),
+    field("voucher-password", "Your password", passwordInput),
+    h("div", { class: "actions" }, h("button", { type: "submit" }, "Sign in")),
   );
   form.addEventListener("submit", (ev) => {
     ev.preventDefault();
@@ -219,22 +182,55 @@ function showVoucher(state: SessionState, error?: string): void {
     passwordInput.value = "";
     void submitting(form, () => api.vouch(user, pass))
       .then(show)
-      .catch((err) => handleError(err, (message) => showVoucher(state, message)));
+      .catch((err) => handleError(err, (message) => showVoucher(message)));
   });
   render(
-    h("h2", { tabindex: "-1" }, "Hand this device to a colleague"),
+    h("h2", { tabindex: "-1" }, "Unlock a colleague's account"),
+    h(
+      "p",
+      {},
+      "Accounts are unlocked in person. First, ",
+      h("strong", {}, info.voucherDescription),
+      " signs in here. Then the locked-out user enters their own username and password on this screen, " +
+        "and you confirm who they are.",
+    ),
+    alertBox(error),
+    form,
+    h("p", { class: "muted small" }, "Locked out yourself? Ask ", info.voucherDescription, " to start this for you."),
+  );
+}
+
+function showClaim(state: SessionState, error?: string, username = ""): void {
+  setSteps("claim");
+  const [usernameInput, passwordInput] = credentialInputs("claim");
+  usernameInput.value = username;
+  usernameInput.autofocus = !username;
+  passwordInput.autofocus = !!username;
+  const form = h(
+    "form",
+    { autocomplete: "off" },
+    field("claim-username", "Username", usernameInput),
+    field("claim-password", "Current password", passwordInput),
+    h("div", { class: "actions" }, h("button", { type: "submit" }, "Continue"), cancelButton()),
+  );
+  form.addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    const user = usernameInput.value;
+    const pass = passwordInput.value;
+    passwordInput.value = "";
+    void submitting(form, () => api.claim(user, pass))
+      .then(show)
+      .catch((err) => handleError(err, (message) => showClaim(state, message, user)));
+  });
+  render(
+    h("h2", { tabindex: "-1" }, "Hand this device to the locked-out user"),
     h(
       "div",
       { class: "handover" },
-      h("p", {}, "Unlocking ", h("strong", {}, state.claimedUsername ?? ""), "."),
-      h(
-        "p",
-        {},
-        "Ask ",
-        h("strong", {}, info.voucherDescription),
-        " to sign in below. They must be with you in person, using this browser on this computer.",
-      ),
+      h("p", {}, h("strong", {}, state.voucher?.displayName ?? ""), " is signed in and will vouch for you."),
+      h("p", {}, "Enter your own username and the password you normally use. It's checked once your account is unlocked."),
     ),
+    info.helpText ? h("p", { class: "muted" }, info.helpText) : null,
     alertBox(error),
     form,
     countdown("This request expires in", state.expiresAt),
@@ -244,12 +240,14 @@ function showVoucher(state: SessionState, error?: string): void {
 function showConfirm(state: SessionState, error?: string): void {
   setSteps("confirm");
   const target = state.target as Account;
+  const voucher = state.voucher as Account;
   const attest = h("input", { type: "checkbox", id: "attest", name: "attest" });
+  const [usernameInput, passwordInput] = credentialInputs("confirm");
   const unlockButton = h("button", { type: "submit", disabled: true }, "Unlock account");
   attest.addEventListener("change", () => (unlockButton.disabled = !attest.checked));
   const form = h(
     "form",
-    {},
+    { autocomplete: "off" },
     h(
       "label",
       { class: "attest", for: "attest" },
@@ -262,18 +260,30 @@ function showConfirm(state: SessionState, error?: string): void {
         " in person right now, and I have confirmed they are who they say they are.",
       ),
     ),
+    h("p", { class: "muted small" }, "Sign in again as ", h("strong", {}, voucher.username), " to unlock the account."),
+    field("confirm-username", "Your username", usernameInput),
+    field("confirm-password", "Your password", passwordInput),
     h("div", { class: "actions" }, unlockButton, cancelButton()),
   );
   form.addEventListener("submit", (ev) => {
     ev.preventDefault();
     if (!attest.checked) return;
-    void submitting(form, () => api.confirm(true))
+    const user = usernameInput.value;
+    const pass = passwordInput.value;
+    passwordInput.value = "";
+    void submitting(form, () => api.confirm(user, pass, true))
       .then(show)
       .catch((err) => handleError(err, (message) => showConfirm(state, message)));
   });
   render(
     h("h2", { tabindex: "-1" }, "Check who you're vouching for"),
-    h("p", {}, "Signed in as ", h("strong", {}, state.voucher?.displayName ?? ""), ". Make sure these details match the person with you."),
+    h(
+      "p",
+      {},
+      "Hand the device back to ",
+      h("strong", {}, voucher.displayName),
+      ". Make sure these details match the person with you.",
+    ),
     accountDetails(target),
     alertBox(error),
     form,
@@ -285,7 +295,7 @@ function showComplete(state: SessionState): void {
   setSteps("done");
   const outcomes = {
     unlocked: { kind: "success", heading: "Account unlocked" },
-    not_locked: { kind: "info", heading: "Your account isn't locked" },
+    not_locked: { kind: "info", heading: "This account isn't locked" },
     verification_failed: { kind: "error", heading: "Password check failed" },
     ineligible: { kind: "error", heading: "Can't unlock this account here" },
   } as const;
@@ -303,8 +313,8 @@ function showComplete(state: SessionState): void {
 
 function show(state: SessionState, error?: string): void {
   switch (state.stage) {
-    case "awaiting_voucher":
-      showVoucher(state, error);
+    case "awaiting_claim":
+      showClaim(state, error);
       break;
     case "awaiting_confirmation":
       showConfirm(state, error);
@@ -313,7 +323,7 @@ function show(state: SessionState, error?: string): void {
       showComplete(state);
       break;
     default:
-      showClaim(error);
+      showVoucher(error);
   }
 }
 
@@ -321,7 +331,7 @@ async function refresh(error?: string): Promise<void> {
   try {
     show(await api.session(), error);
   } catch (err) {
-    showClaim(err instanceof Error ? err.message : String(err));
+    showVoucher(err instanceof Error ? err.message : String(err));
   }
 }
 

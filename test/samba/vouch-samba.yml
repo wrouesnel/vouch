@@ -2,7 +2,7 @@
 # Run from the repository root: ./vouch --config-file test/samba/vouch-samba.yml
 web:
   listen: "127.0.0.1:8080"
-  title: "Unlock your account"
+  title: "Account unlock"
   voucherDescription: "a member of the Helpdesk group"
 directory:
   urls: ["ldap://127.0.0.1:10389"]

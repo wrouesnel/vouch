@@ -1,6 +1,6 @@
 // Client for the vouch API. Types mirror api/vouch.yaml.
 
-export type Stage = "start" | "awaiting_voucher" | "awaiting_confirmation" | "complete";
+export type Stage = "start" | "awaiting_claim" | "awaiting_confirmation" | "complete";
 export type Outcome = "not_locked" | "unlocked" | "verification_failed" | "ineligible";
 
 export interface Info {
@@ -87,9 +87,10 @@ export const api = {
   info: () => request<Info>("GET", "/info"),
   session: () => request<SessionState>("GET", "/session"),
   cancel: () => request<void>("DELETE", "/session"),
-  claim: (username: string, password: string) =>
-    request<SessionState>("POST", "/session/claim", { username, password }),
   vouch: (username: string, password: string) =>
     request<SessionState>("POST", "/session/voucher", { username, password }),
-  confirm: (attest: boolean) => request<SessionState>("POST", "/session/confirm", { attest }),
+  claim: (username: string, password: string) =>
+    request<SessionState>("POST", "/session/claim", { username, password }),
+  confirm: (username: string, password: string, attest: boolean) =>
+    request<SessionState>("POST", "/session/confirm", { username, password, attest }),
 };
