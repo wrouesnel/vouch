@@ -1,0 +1,59 @@
+# vouch configuration. Loaded from the working directory unless --config-file is set.
+# Keys map to EntrypointConfig in pkg/entrypoints/vouch/config.go. Unknown keys are an error.
+# Relative file paths are resolved against this file's directory.
+
+web:
+  # Address to listen on.
+  listen: ":8080"
+  # Serve HTTPS directly. Without these, run vouch behind a TLS-terminating reverse proxy.
+  # tlsCertFile: tls/vouch.crt
+  # tlsKeyFile: tls/vouch.key
+  # Reverse proxies whose X-Forwarded-For header is trusted for the client address.
+  # trustedProxies: ["10.0.0.0/24"]
+  # Drop the Secure flag from the session cookie. Only for plain HTTP on hosts other than localhost.
+  # insecureCookies: false
+  title: "Unlock your account"
+  # Finishes the sentence "Ask ... to sign in below."
+  voucherDescription: "a member of the IT Service Desk or your team leader"
+  # helpText: "Need help? Call the service desk on 1234."
+
+directory:
+  # Domain controllers, tried in order. Use ldaps://, or ldap:// with startTLS: true.
+  urls:
+    - ldaps://dc1.example.com
+    - ldaps://dc2.example.com
+  # startTLS: false
+  # PEM bundle to trust instead of the system CA pool.
+  # caFile: ad-ca.pem
+  # insecureSkipVerify: false
+  # timeout: 10s
+  baseDN: "DC=example,DC=com"
+  # Service account. It needs read access to users and groups, and write access to
+  # lockoutTime (plus userAccountControl if disableOnFailedVerification is on).
+  bindDN: "CN=svc-vouch,OU=Service Accounts,DC=example,DC=com"
+  bindPasswordFile: svc-vouch.password
+  # bindPassword: ""
+  # {username} is replaced by the escaped username the user typed.
+  # userFilter: "(&(objectCategory=person)(objectClass=user)(|(sAMAccountName={username})(userPrincipalName={username})))"
+
+policy:
+  # Members of these groups (directly or through nested groups) may vouch for others.
+  voucherGroups:
+    - "CN=Service Desk,OU=Groups,DC=example,DC=com"
+  # Members of these groups can never be unlocked here.
+  protectedGroups:
+    - "CN=Domain Admins,CN=Users,DC=example,DC=com"
+    - "CN=Enterprise Admins,CN=Users,DC=example,DC=com"
+  # If set, only members of these groups can be unlocked.
+  # eligibleGroups: []
+  # Disable an account if, after unlocking it, the password from step 1 turns out to be wrong.
+  disableOnFailedVerification: false
+  # How long the whole exchange may take, and how long the voucher has to confirm.
+  sessionLifetime: 5m
+  confirmWindow: 2m
+  # Let a session continue from a different client address (e.g. clients behind rotating NAT).
+  allowClientIPChange: false
+  # Attempts allowed per client address and per username.
+  rateLimit:
+    attempts: 10
+    window: 15m

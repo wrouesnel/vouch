@@ -23,7 +23,7 @@ get the package name, e.g. `cmd/foo-bar` is implemented by `pkg/entrypoints/foo_
 binary also needs an entry in `.gitignore` for the symlink `go run mage.go binary` creates.
 
 Test entrypoints by calling `Entrypoint(ctx, args)` directly, as in
-`pkg/entrypoints/application_sample/entrypoint_test.go`.
+`pkg/entrypoints/vouch/entrypoint_test.go`.
 
 ## Build commands
 
@@ -44,20 +44,15 @@ A web interface is optional. If `web/package.json` exists, the build installs th
 version in `.nvmrc` and builds `web/` into `web/dist` for embedding. Otherwise the web build
 is skipped. Set `SKIP_WEB=1` to skip it regardless.
 
-## Bootstrapping a new project
+## This project
 
-This stanza to be executed once and then removed from this file once the application is
-setup.
+vouch is a self-service AD account unlock page. Read README.md for the workflow and security
+model before changing `pkg/unlock`.
 
-* Replace the template `github.com/wrouesnel/golang-template` module path in `go.mod` and
-  all imports.
-* Change the name in `version/version.go` to the application name, and update `Description`.
-* Rename `golang-template.yml` to match `version.Name`, and update the config file name in
-  `Dockerfile`.
-* Rename `cmd/application-sample` and `pkg/entrypoints/application_sample` to the real binary
-  name, and update `Name` in the entrypoint, the `.gitignore` symlink entry and the
-  `Dockerfile` `ENTRYPOINT`.
-* Delete `.nvmrc` if there is no web interface. If there is, uncomment the `npm` entry in
-  `.github/dependabot.yml`.
-* Read the README.md to understand template structure and then replace it with
-  the actual README.md
+* The API is defined in `api/vouch.yaml`. After changing it, run `go run mage.go goGenerate`
+  (or `go generate ./pkg/api` with `.bin` on the PATH) and commit `pkg/api/api.gen.go`.
+* `web/` is a dependency-light TypeScript UI built by Vite. Build DOM with the `h()` helper, never
+  `innerHTML`: directory data is shown on the page. Keep `web/src/api.ts` in step with the spec.
+* `web/dist/.gitkeep` is committed so the Go embed compiles before the web build has run.
+* Integration tests against real AD semantics run on the Samba DC in `test/samba` (rootless
+  podman). They are skipped unless `VOUCH_SAMBA_URL` is set.

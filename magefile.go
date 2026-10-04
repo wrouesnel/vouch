@@ -1080,6 +1080,19 @@ func Web() error {
 	return nil
 }
 
+// webDistFiles lists the built web interface, which is embedded in the binary, so a change to
+// it alone still triggers a rebuild.
+func webDistFiles() []string {
+	files := []string{}
+	_ = filepath.Walk(path.Join(webDir, "dist"), func(p string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			files = append(files, p)
+		}
+		return nil
+	})
+	return files
+}
+
 func makeBuilder(cmd string, platform Platform) func() error {
 	f := func() error {
 		cmdSrc := fmt.Sprintf("./%s/%s", must(filepath.Rel(curDir, cmdDir)), cmd)
@@ -1090,7 +1103,7 @@ func makeBuilder(cmd string, platform Platform) func() error {
 		}
 
 		Log("Checking for changes:", platform.PlatformBin(cmd))
-		if changed, err := target.Path(platform.PlatformBin(cmd), goSrc...); !changed {
+		if changed, err := target.Path(platform.PlatformBin(cmd), append(webDistFiles(), goSrc...)...); !changed {
 			if err != nil {
 				if !os.IsNotExist(err) {
 					return errors.Wrapf(err, "error while checking for changes: cmd: %s", cmd)

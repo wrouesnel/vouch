@@ -1,0 +1,30 @@
+# Disposable Samba AD domain controller for vouch integration tests.
+# Realm VOUCH.TEST / domain VOUCH. Not for production use.
+FROM docker.io/library/debian:trixie-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      samba samba-ad-dc samba-ad-provision samba-dsdb-modules samba-vfs-modules \
+      winbind krb5-user ldap-utils ldb-tools \
+      ca-certificates procps iproute2 \
+ && rm -rf /var/lib/apt/lists/* \
+ && rm -f /etc/samba/smb.conf \
+ && rm -rf /var/lib/samba/* /var/cache/samba/* \
+ # Rootless podman only maps 65536 uids into the container (/etc/subuid), but
+ # Samba's DC idmap allocates unix ids from 3000000. Provisioning chowns the
+ # sysvol tree to those ids, which fails (EINVAL) inside the user namespace and
+ # makes samba-tool panic ("Security context active token stack underflow").
+ # Move the idmap range inside the mapped uid range.
+ && sed -i -e 's/^lowerBound: .*/lowerBound: 30000/' -e 's/^upperBound: .*/upperBound: 60000/' \
+      /usr/share/samba/setup/idmap_init.ldif
+
+ENV SAMBA_REALM=VOUCH.TEST \
+    SAMBA_DOMAIN=VOUCH \
+    SAMBA_ADMIN_PASSWORD=Admin-Passw0rd!
+
+COPY entrypoint.sh /usr/local/sbin/entrypoint.sh
+RUN chmod 0755 /usr/local/sbin/entrypoint.sh
+
+EXPOSE 389 636
+ENTRYPOINT ["/usr/local/sbin/entrypoint.sh"]

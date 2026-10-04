@@ -52,6 +52,26 @@ jobs:
         with:
           path-to-profile: .cover.out
 
+  # Runs the directory and workflow tests against a real Samba AD DC (test/samba).
+  samba-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Start Samba AD DC
+        run: test/samba/start.sh
+      - name: Samba integration tests
+        env:
+          VOUCH_SAMBA_URL: ldap://127.0.0.1:10389
+        run: go test -count=1 -v -run Samba ./pkg/directory/
+      - name: Samba logs
+        if: failure()
+        run: podman logs --tail 200 vouch-samba-test
+
   build:
     runs-on: ubuntu-latest
     steps:

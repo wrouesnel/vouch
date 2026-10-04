@@ -1,0 +1,238 @@
+openapi: 3.0.3
+info:
+  title: vouch
+  version: "1"
+  description: |
+    Self-service unlock of locked Active Directory accounts.
+
+    A user whose account is locked proves they know its password, then a colleague from an
+    authorised group signs in on the same browser and vouches that the user is who they claim
+    to be. Every step after the first is tied to a server-side session that lives in an
+    HttpOnly, SameSite=Strict cookie, so the whole exchange has to happen in one browser.
+
+    Errors are returned as a `Problem`. A request that changes state must be sent as
+    `application/json` from the same origin.
+servers:
+  - url: /api/v1
+paths:
+  /info:
+    get:
+      operationId: getInfo
+      summary: Settings the web interface needs to render
+      responses:
+        "200":
+          description: Interface settings
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Info"
+  /session:
+    get:
+      operationId: getSession
+      summary: The current unlock session of this browser
+      responses:
+        "200":
+          description: The session state. `stage` is `start` if there is no session.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionState"
+        default:
+          $ref: "#/components/responses/Problem"
+    delete:
+      operationId: cancelSession
+      summary: Abandon the current unlock session
+      responses:
+        "204":
+          description: The session was removed, or there wasn't one.
+  /session/claim:
+    post:
+      operationId: submitClaim
+      summary: Step 1 - the locked-out user enters their username and password
+      description: |
+        Checks the password by binding to the directory. If the account is locked a new session
+        is started and the response is in the `awaiting_voucher` stage. If the password works
+        the account isn't locked and the response is `complete` with outcome `not_locked`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Credentials"
+      responses:
+        "200":
+          description: The new session state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionState"
+        default:
+          $ref: "#/components/responses/Problem"
+  /session/voucher:
+    post:
+      operationId: submitVoucher
+      summary: Step 2 - a colleague signs in to vouch for the user
+      description: |
+        The voucher must be a member, directly or through nested groups, of one of the configured
+        voucher groups. On success the response is in the `awaiting_confirmation` stage and
+        includes the details of the account being unlocked so the voucher can check them.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Credentials"
+      responses:
+        "200":
+          description: The updated session state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionState"
+        default:
+          $ref: "#/components/responses/Problem"
+  /session/confirm:
+    post:
+      operationId: confirmVouch
+      summary: Step 3 - the voucher confirms the user's identity and the account is unlocked
+      description: |
+        Unlocks the account, then verifies the password given in step 1 against it. The response
+        is `complete` with outcome `unlocked` or `verification_failed`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Confirmation"
+      responses:
+        "200":
+          description: The final session state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionState"
+        default:
+          $ref: "#/components/responses/Problem"
+components:
+  responses:
+    Problem:
+      description: The request failed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+  schemas:
+    Info:
+      type: object
+      required: [title, voucherDescription, sessionLifetimeSeconds, confirmWindowSeconds]
+      properties:
+        title:
+          type: string
+          description: Page title.
+        voucherDescription:
+          type: string
+          description: Who may vouch for a user, in words the user understands.
+        helpText:
+          type: string
+          description: Optional extra guidance shown on the first step.
+        sessionLifetimeSeconds:
+          type: integer
+          description: How long a session lasts from step 1.
+        confirmWindowSeconds:
+          type: integer
+          description: How long the voucher has to confirm after signing in.
+    Credentials:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: sAMAccountName, userPrincipalName or DOMAIN\sAMAccountName.
+        password:
+          type: string
+          minLength: 1
+          maxLength: 1024
+          format: password
+    Confirmation:
+      type: object
+      required: [attest]
+      properties:
+        attest:
+          type: boolean
+          description: The voucher attests that they are with the user in person and have confirmed their identity.
+    Stage:
+      type: string
+      enum: [start, awaiting_voucher, awaiting_confirmation, complete]
+    Outcome:
+      type: string
+      enum: [not_locked, unlocked, verification_failed, ineligible]
+      description: |
+        * `not_locked` - the password works, so the account isn't locked.
+        * `unlocked` - the account was unlocked and the password verified.
+        * `verification_failed` - the account was unlocked but the password from step 1 was wrong.
+        * `ineligible` - this account can't be unlocked by self-service.
+    Account:
+      type: object
+      required: [username, displayName]
+      properties:
+        username:
+          type: string
+        displayName:
+          type: string
+        mail:
+          type: string
+        title:
+          type: string
+        department:
+          type: string
+        description:
+          type: string
+    SessionState:
+      type: object
+      required: [stage]
+      properties:
+        stage:
+          $ref: "#/components/schemas/Stage"
+        claimedUsername:
+          type: string
+          description: The username entered in step 1.
+        voucher:
+          $ref: "#/components/schemas/Account"
+        target:
+          $ref: "#/components/schemas/Account"
+        outcome:
+          $ref: "#/components/schemas/Outcome"
+        message:
+          type: string
+          description: A human-readable explanation of the outcome.
+        expiresAt:
+          type: string
+          format: date-time
+          description: When the session expires.
+        confirmBy:
+          type: string
+          format: date-time
+          description: In `awaiting_confirmation`, when the voucher's sign-in expires.
+    Problem:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum:
+            - bad_request
+            - invalid_credentials
+            - account_restricted
+            - rate_limited
+            - no_session
+            - session_expired
+            - wrong_stage
+            - presence_mismatch
+            - voucher_not_authorised
+            - voucher_is_claimant
+            - attestation_required
+            - directory_error
+        message:
+          type: string

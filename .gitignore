@@ -12,7 +12,7 @@
 
 # Symlinks to the current platform's binaries made by `go run mage.go binary`.
 # There is one per directory under cmd/ - add an entry for each new binary.
-/application-sample
+/vouch
 
 # Profiling output from --cpu-profile, --mem-profile and SIGUSR1/SIGUSR2
 *.pprof
@@ -21,4 +21,5 @@
 
 # Optional web interface
 /web/node_modules/
-/web/dist/
+/web/dist/*
+!/web/dist/.gitkeep

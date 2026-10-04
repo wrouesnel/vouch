@@ -1,3 +1,0 @@
-# Default configuration file, loaded from the working directory unless --config-file is set.
-# Keys map to EntrypointConfig in pkg/entrypoints/application_sample/config.go.
-{}

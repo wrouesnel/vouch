@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>Unlock your account</title>
+    <link rel="stylesheet" href="/src/style.css" />
+    <script type="module" src="/src/main.ts"></script>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="masthead">
+        <svg class="mark" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M7 10V7a5 5 0 0 1 9.6-2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+          <rect x="4" y="10" width="16" height="11" rx="2.5" fill="none" stroke="currentColor" stroke-width="2" />
+          <circle cx="12" cy="15.5" r="1.6" fill="currentColor" />
+        </svg>
+        <h1 id="title">Unlock your account</h1>
+      </header>
+      <ol class="steps" id="steps" aria-label="Progress">
+        <li data-step="claim">Your details</li>
+        <li data-step="vouch">Colleague signs in</li>
+        <li data-step="confirm">Colleague confirms</li>
+      </ol>
+      <section class="card" id="app" aria-live="polite">
+        <p class="muted">Loading…</p>
+      </section>
+      <noscript><p class="card">This page needs JavaScript.</p></noscript>
+    </main>
+  </body>
+</html>

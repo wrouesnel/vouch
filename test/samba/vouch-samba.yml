@@ -1,0 +1,14 @@
+# vouch configuration for the Samba test DC started by test/samba/start.sh.
+# Run from the repository root: ./vouch --config-file test/samba/vouch-samba.yml
+web:
+  listen: "127.0.0.1:8080"
+  title: "Unlock your account"
+  voucherDescription: "a member of the Helpdesk group"
+directory:
+  urls: ["ldap://127.0.0.1:10389"]
+  baseDN: "DC=vouch,DC=test"
+  bindDN: "CN=svc-vouch,CN=Users,DC=vouch,DC=test"
+  bindPassword: "Passw0rd-svc-vouch!"
+policy:
+  voucherGroups: ["CN=Helpdesk,CN=Users,DC=vouch,DC=test"]
+  protectedGroups: ["CN=Protected-Users-Vouch,CN=Users,DC=vouch,DC=test"]

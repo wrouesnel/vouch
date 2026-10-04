@@ -17,7 +17,7 @@ RUN go run mage.go releaseBin "${TARGETOS}-${TARGETARCH}" \
 FROM gcr.io/distroless/static-debian12:nonroot
 
 COPY --from=build /out/ /app/
-COPY golang-template.yml /app/golang-template.yml
+COPY vouch.yml /app/vouch.yml
 
 WORKDIR /app
-ENTRYPOINT ["/app/application-sample"]
+ENTRYPOINT ["/app/vouch"]

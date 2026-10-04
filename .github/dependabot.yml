@@ -16,8 +16,7 @@ updates:
     schedule:
       # Check for updates to Dockerfile base images every week
       interval: "weekly"
-  # Uncomment if the project has a web interface under web/.
-  # - package-ecosystem: "npm"
-  #   directory: "/web"
-  #   schedule:
-  #     interval: "weekly"
+  - package-ecosystem: "npm"
+    directory: "/web"
+    schedule:
+      interval: "weekly"

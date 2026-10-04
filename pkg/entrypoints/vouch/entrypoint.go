@@ -1,4 +1,4 @@
-package application_sample
+package vouch
 
 import (
 	"context"
@@ -11,8 +11,8 @@ import (
 	"runtime/pprof"
 
 	"github.com/wrouesnel/ctxstdio"
-	"github.com/wrouesnel/golang-template/version"
 	"github.com/wrouesnel/kongutil"
+	"github.com/wrouesnel/vouch/version"
 
 	"github.com/chigopher/pathlib"
 	"go.uber.org/zap"
@@ -22,7 +22,7 @@ import (
 )
 
 // Name is the name of this subapplication.
-const Name = "application-sample"
+const Name = "vouch"
 
 // CLIConfig is the root command line configuration parsed by kong.
 type CLIConfig struct {
