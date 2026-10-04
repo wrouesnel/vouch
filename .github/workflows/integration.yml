@@ -91,3 +91,15 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - name: Build
         run: go run mage.go binary
+
+  # Every branch and PR builds the image, so a broken Dockerfile fails CI. Pushes to main also
+  # publish it. Tags are skipped here: release.yml builds and publishes them.
+  container:
+    if: github.ref_type != 'tag'
+    needs: [style, lint, test, samba-integration, build]
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/container.yml
+    with:
+      push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}

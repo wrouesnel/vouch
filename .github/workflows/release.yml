@@ -7,7 +7,21 @@ on:
 
 jobs:
   integration:
+    # integration.yml's container job asks for packages: write (it's skipped for tags, but
+    # a called workflow can't ask for more than its caller grants).
+    permissions:
+      contents: read
+      packages: write
     uses: ./.github/workflows/integration.yml
+
+  container:
+    needs: integration
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/container.yml
+    with:
+      push: true
 
   generate-release-matrix:
     runs-on: ubuntu-latest

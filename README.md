@@ -122,8 +122,32 @@ The build installs the Node.js version in `.nvmrc` into `.node/`, builds the web
 `web/` and embeds it in the binary. `go run mage.go -l` lists every target. CI runs `style`,
 `lint`, `test` and `binary`.
 
-Once the repository is on GitHub, `.github/workflows/container.yml` builds a container image and
-publishes it to `ghcr.io/wrouesnel/vouch`. Mount your configuration over `/app/vouch.yml`.
+## Container image
+
+Multi-arch images (`linux/amd64`, `linux/arm64`) are published to the GitHub Container
+Registry:
+
+| Tag | Published when |
+|---|---|
+| `latest`, `main`, `sha-<commit>` | a push to `main` passes CI |
+| `<version>`, `<major>.<minor>`, `<major>` | a `v*` tag is pushed and its release passes CI |
+
+The image runs as a non-root user, listens on 8080 and logs JSON. Mount your configuration
+over `/app/vouch.yml`, and the service account's password file next to it:
+
+```sh
+docker run -d --name vouch -p 8080:8080 \
+  -v "$PWD/vouch.yml:/app/vouch.yml:ro" \
+  -v "$PWD/svc-vouch.password:/app/svc-vouch.password:ro" \
+  ghcr.io/wrouesnel/vouch:latest
+```
+
+Put it behind a TLS-terminating reverse proxy, and list the proxy's address in
+`web.trustedProxies` so presence checks and rate limits see the real client address.
+
+Every branch and pull request also builds the image without pushing it, so a broken
+Dockerfile fails CI. The build is `.github/workflows/container.yml`, called from
+`integration.yml` and `release.yml` once the tests have passed.
 
 ## Development
 

@@ -49,8 +49,12 @@ is skipped. Set `SKIP_WEB=1` to skip it regardless.
 vouch is a self-service AD account unlock page. Read README.md for the workflow and security
 model before changing `pkg/unlock`.
 
-* The API is defined in `api/vouch.yaml`. After changing it, run `go run mage.go goGenerate`
-  (or `go generate ./pkg/api` with `.bin` on the PATH) and commit `pkg/api/api.gen.go`.
+* The API is defined in `api/vouch.yaml`. After changing it, run `go generate ./pkg/api` and
+  commit `pkg/api/api.gen.go`. The generate directive pins the oapi-codegen version with
+  `go run`, so it needs no installed tools (the container build relies on this).
+* The container image is built by `.github/workflows/container.yml`, a reusable workflow called
+  after the tests pass: from `integration.yml` (builds everywhere, pushes from `main`) and from
+  `release.yml` (pushes version tags). Check Dockerfile changes with `podman build .`.
 * `web/` is a dependency-light TypeScript UI built by Vite. Build DOM with the `h()` helper, never
   `innerHTML`: directory data is shown on the page. Keep `web/src/api.ts` in step with the spec.
 * `web/dist/.gitkeep` is committed so the Go embed compiles before the web build has run.
