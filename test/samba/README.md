@@ -34,17 +34,27 @@ verification (`LDAPTLS_REQCERT=never`).
   Complexity is off because AD complexity rejects a password that contains the
   account name. Minimum password age is 0.
 - Users in `CN=Users,DC=vouch,DC=test` (CN = username), each with password
-  `Passw0rd-<name>!`: `svc-vouch`, `alice`, `bob`, `carol`, `dadmin`.
+  `Passw0rd-<name>!`: `svc-vouch`, `alice`, `bob`, `carol`, `dadmin`, `erin`.
 - Groups: `Helpdesk` ⊃ `Helpdesk-L1` ⊃ `bob` (nested), and
   `Protected-Users-Vouch` ⊃ `dadmin`.
-- Delegation on `CN=Users`, inherited by user objects only:
+- A fine-grained password policy, `vouch-test-pso`, with lockout threshold 5 (above the
+  domain's 3), applied to `erin`, to test reading the threshold from a PSO.
+- The same permission set `extras/Grant-VouchServiceAccount.ps1` grants. Inherit-only object
+  ACEs (`CIIO`, PowerShell's `Descendents`) on `CN=Users` for user objects:
   ```
-  (OA;CI;WP;28630ebf-41d5-11d1-a9c1-0000f80367c1;bf967aba-0de6-11d0-a285-00aa003049e2;<svc-vouch SID>)  lockoutTime
-  (OA;CI;WP;bf967a68-0de6-11d0-a285-00aa003049e2;bf967aba-0de6-11d0-a285-00aa003049e2;<svc-vouch SID>)  userAccountControl
+  (OA;CIIO;WP;28630ebf-41d5-11d1-a9c1-0000f80367c1;bf967aba-0de6-11d0-a285-00aa003049e2;<svc-vouch SID>)  write lockoutTime
+  (OA;CIIO;WP;bf967a68-0de6-11d0-a285-00aa003049e2;bf967aba-0de6-11d0-a285-00aa003049e2;<svc-vouch SID>)  write userAccountControl
+  (OA;CIIO;WP;bf967950-0de6-11d0-a285-00aa003049e2;bf967aba-0de6-11d0-a285-00aa003049e2;<svc-vouch SID>)  write description
+  (OA;CIIO;RP;b77ea093-88d0-4780-9a98-911f8e8b1dca;bf967aba-0de6-11d0-a285-00aa003049e2;<svc-vouch SID>)  read msDS-ResultantPSO
   ```
-  These are set with `samba-tool dsacl set`. The GUIDs were checked against
-  this schema's `schemaIDGUID`s, and the ACEs propagate to existing users as
-  `OA;CIID;...`.
+  and on `CN=Password Settings Container,CN=System` for password settings objects:
+  ```
+  (OA;CIIO;RP;b8c8c35e-4a19-4a95-99d0-69fe4446286f;3bcd9db8-f84b-451c-952f-6c52b81f9ec6;<svc-vouch SID>)  read msDS-LockoutThreshold
+  ```
+  These are set with `samba-tool dsacl set`, and the GUIDs were checked against this schema's
+  `schemaIDGUID`s. Without the last grant, `svc-vouch` can see that a PSO applies to `erin`
+  but can't read its threshold. Keep this list in step with the PowerShell script:
+  `TestSambaServiceAccountIsLeastPrivilege` checks the account can't do anything beyond it.
 
 ## Rootless podman workarounds (in the Containerfile and entrypoint)
 
@@ -110,3 +120,9 @@ filter doesn't match bob, and bob's `memberOf` attribute lists only
   inheritance turned off, and the delegation wouldn't reach them.
   `Protected-Users-Vouch` is an ordinary group used to test vouch's own
   protected-group policy. It isn't AD's built-in "Protected Users" group.
+
+## LDAPS certificate serial numbers
+
+Samba generates its self-signed certificate with a random serial number, which is sometimes
+negative. Go rejects such certificates by default, so the integration tests set
+`//go:debug x509negativeserial=1`. Real AD certificates don't have negative serials.

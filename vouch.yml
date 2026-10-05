@@ -57,6 +57,11 @@ policy:
   rateLimit:
     attempts: 10
     window: 15m
+  # Written to an account's description when vouch disables it. That only happens as a
+  # fail-safe, if an account can't be re-locked after its password is checked. Placeholders:
+  # {date} (UTC), {reason}, {session} (the audit session id), {voucher}, {target} and
+  # {previous} (the old description). "-" leaves descriptions unchanged.
+  disableDescription: "Disabled by vouch on {date}: {reason} (audit session {session})"
 
 # The audit trail. The final unlock is committed here before it happens: if no configured sink
 # can commit the record, the account is not unlocked. Set any combination of sinks; events go to

@@ -3,6 +3,7 @@ package unlock_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -223,12 +224,65 @@ func TestRelockFailureDisablesAndStops(t *testing.T) {
 	if !f.dir.Get("alice").User.Disabled() {
 		t.Fatal("alice should be disabled as a safeguard when re-lock fails")
 	}
+	want := "Disabled by vouch on 2026-01-01T09:00:00Z: it could not be re-locked after its password " +
+		"was checked during a self-service unlock (audit session "
+	if got := f.dir.Get("alice").User.Description; !strings.HasPrefix(got, want) {
+		t.Fatalf("description: got %q, want prefix %q", got, want)
+	}
 	if !f.sink.has("relock_failed") {
 		t.Fatal("the re-lock failure should be audited")
 	}
 	if f.dir.Unlocks != 0 {
 		t.Fatal("no permanent unlock should happen")
 	}
+}
+
+func TestDisableDescriptionTemplate(t *testing.T) {
+	t.Run("custom template with placeholders", func(t *testing.T) {
+		f := newFixture(t, func(p *unlock.Policy) {
+			p.DisableDescription = "{date} {target} via {voucher}: {reason}. Was: {previous}"
+		})
+		f.dir.Get("alice").User.Description = "Accounts team"
+		f.dir.RelockErr = errors.New("re-lock impossible")
+		sessionID := f.start(t)
+		if _, err := f.svc.Claim(f.ctx, sessionID, f.client, "alice", alicePass); err != nil {
+			t.Fatal(err)
+		}
+		want := "2026-01-01T09:00:00Z alice via bob: it could not be re-locked after its password was " +
+			"checked during a self-service unlock. Was: Accounts team"
+		if got := f.dir.Get("alice").User.Description; got != want {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+	})
+
+	t.Run("dash leaves the description alone", func(t *testing.T) {
+		f := newFixture(t, func(p *unlock.Policy) { p.DisableDescription = unlock.NoDisableDescription })
+		f.dir.Get("alice").User.Description = "Accounts team"
+		f.dir.RelockErr = errors.New("re-lock impossible")
+		sessionID := f.start(t)
+		if _, err := f.svc.Claim(f.ctx, sessionID, f.client, "alice", alicePass); err != nil {
+			t.Fatal(err)
+		}
+		if got := f.dir.Get("alice").User.Description; got != "Accounts team" {
+			t.Fatalf("description changed to %q", got)
+		}
+		if !f.dir.Get("alice").User.Disabled() {
+			t.Fatal("alice should still be disabled")
+		}
+	})
+
+	t.Run("long descriptions are truncated to the AD limit", func(t *testing.T) {
+		f := newFixture(t, func(p *unlock.Policy) { p.DisableDescription = "{previous}{previous}" })
+		f.dir.Get("alice").User.Description = strings.Repeat("x", 1000)
+		f.dir.RelockErr = errors.New("re-lock impossible")
+		sessionID := f.start(t)
+		if _, err := f.svc.Claim(f.ctx, sessionID, f.client, "alice", alicePass); err != nil {
+			t.Fatal(err)
+		}
+		if got := len([]rune(f.dir.Get("alice").User.Description)); got != directory.MaxDescriptionLength {
+			t.Fatalf("length %d, want %d", got, directory.MaxDescriptionLength)
+		}
+	})
 }
 
 func TestVoucherSignIn(t *testing.T) {

@@ -43,6 +43,20 @@ The re-lock generates failed-logon events (Windows event 4625) on the domain con
 every one is recorded in vouch's own audit log. If the account can't be re-locked for any reason
 (for example lockout is disabled, so there's no threshold to reach), vouch **disables** the
 account as a fail-safe rather than leave it unlocked, and records a `relock_failed` audit event.
+It also writes the account's description, so whoever finds it disabled can see when and why,
+for example:
+
+> Disabled by vouch on 2026-10-06T00:10:37Z: it could not be re-locked after its password was
+> checked during a self-service unlock (audit session Td0-huzNU0Zh)
+
+The text is `policy.disableDescription`, a template with `{date}`, `{reason}`, `{session}`,
+`{voucher}`, `{target}` and `{previous}` (the old description) placeholders; set it to `-` to
+leave descriptions alone. The disable and the description are written in one change, so the
+account is never disabled without its explanation. If the service account can't write the
+description, vouch still disables the account and logs that the description is missing.
+
+If a fine-grained password policy applies to the account but vouch can't read its lockout
+threshold, vouch refuses to touch the account at all, rather than guess the threshold.
 
 ### The unlock is gated on a committed audit record
 
@@ -126,28 +140,51 @@ separate from this audit trail.
 
 ## Active Directory setup
 
-**Service account.** vouch needs a dedicated account (e.g. `svc-vouch`). It needs:
+**Service account.** Create a dedicated, unprivileged account (e.g. `svc-vouch`) with a long
+random password, and grant it exactly what vouch needs with the script in `extras/`, run as a
+Domain Admin from a machine with the RSAT ActiveDirectory module:
 
-* Read access to users and groups — Domain Users has this by default — including the lockout
-  threshold (`lockoutThreshold` on the domain, or `msDS-LockoutThreshold` on a password-settings
-  object), which is readable by default.
-* Write access to `lockoutTime` on the user objects that may be unlocked, to clear and (during
-  the password check) restore the lock:
+```powershell
+# Preview, then apply. Pass every OU holding users vouch may unlock.
+.\extras\Grant-VouchServiceAccount.ps1 -Identity svc-vouch -TargetOU 'OU=Staff,DC=example,DC=com' -WhatIf
+.\extras\Grant-VouchServiceAccount.ps1 -Identity svc-vouch -TargetOU 'OU=Staff,DC=example,DC=com'
+```
 
-  ```bat
-  dsacls "OU=Staff,DC=example,DC=com" /I:S /G "EXAMPLE\svc-vouch:WP;lockoutTime;user"
-  ```
+It grants these five permissions and nothing else:
 
-* Write access to `userAccountControl`, used only by the fail-safe that disables an account if it
-  can't be re-locked after the password check:
+| Where | Inherited by | Permission | Why |
+|---|---|---|---|
+| each target OU | user objects | Write `lockoutTime` | clear the lockout |
+| each target OU | user objects | Write `userAccountControl` | the fail-safe disable |
+| each target OU | user objects | Write `description` | explain a fail-safe disable |
+| each target OU | user objects | Read `msDS-ResultantPSO` | find the account's fine-grained password policy |
+| `CN=Password Settings Container,CN=System` | password settings objects | Read `msDS-LockoutThreshold` | read that policy's lockout threshold |
 
-  ```bat
-  dsacls "OU=Staff,DC=example,DC=com" /I:S /G "EXAMPLE\svc-vouch:RPWP;userAccountControl;user"
-  ```
+Everything else vouch reads (users, group membership, the domain lockout policy and the
+computed lockout state) is covered by Authenticated Users' default read access. The re-lock
+needs no permission at all, since anyone may attempt a bind.
 
-The re-lock itself needs no permission — anyone may attempt a bind. Give the account a long,
-random password and no interactive-logon rights; it only ever binds and edits those two
-attributes.
+The script is idempotent and supports `-WhatIf` and `-Confirm`. It refuses to set up an account
+that is already privileged (Domain/Enterprise/Schema Admins, Administrators, the operator
+groups, or protected by AdminSDHolder). It refuses the domain root as a target, warns about any
+other permission the account holds on the objects it touches (`-RemoveOtherPermissions` removes
+them), and warns about password settings objects that block inheritance. `-Revoke` takes the
+permissions away again.
+
+The same five permissions are granted to the test DC by `test/samba/setup.sh`. The integration
+tests show they're enough for every vouch operation, and that the account can't write any other
+attribute, join a voucher group, change a password policy or reset a password. The script itself
+has been parsed and checked with PSScriptAnalyzer, but not yet run against a Windows domain.
+
+If you'd rather not run the script, these are the `dsacls` equivalents:
+
+```bat
+dsacls "OU=Staff,DC=example,DC=com" /I:S /G "EXAMPLE\svc-vouch:WP;lockoutTime;user"
+dsacls "OU=Staff,DC=example,DC=com" /I:S /G "EXAMPLE\svc-vouch:WP;userAccountControl;user"
+dsacls "OU=Staff,DC=example,DC=com" /I:S /G "EXAMPLE\svc-vouch:WP;description;user"
+dsacls "OU=Staff,DC=example,DC=com" /I:S /G "EXAMPLE\svc-vouch:RP;msDS-ResultantPSO;user"
+dsacls "CN=Password Settings Container,CN=System,DC=example,DC=com" /I:S /G "EXAMPLE\svc-vouch:RP;msDS-LockoutThreshold;msDS-PasswordSettings"
+```
 
 Don't delegate at the domain root. Accounts protected by AdminSDHolder (`adminCount=1`) don't
 inherit delegations, so the service account can't touch domain admins even if they aren't in a
@@ -194,29 +231,51 @@ The build installs the Node.js version in `.nvmrc` into `.node/`, builds the web
 ## Container image
 
 Multi-arch images (`linux/amd64`, `linux/arm64`) are published to the GitHub Container
-Registry:
+Registry as `ghcr.io/wrouesnel/vouch`, and can be pulled without logging in:
 
-| Tag | Published when |
+| Tag | Points at |
 |---|---|
-| `latest`, `main`, `sha-<commit>` | a push to `main` passes CI |
-| `<version>`, `<major>.<minor>`, `<major>` | a `v*` tag is pushed and its release passes CI |
+| `<version>` (e.g. `0.1.0`), `<major>.<minor>`, `<major>` | that release |
+| `latest` | the newest release (not pre-releases) |
+| `main` | the newest build of the `main` branch |
+| `sha-<commit>` | a specific build |
 
-The image runs as a non-root user, listens on 8080 and logs JSON. Mount your configuration
-over `/app/vouch.yml`, and the service account's password file next to it:
+Pin a version in production. Each pushed image carries a build-provenance attestation and an
+SBOM (`docker buildx imagetools inspect ghcr.io/wrouesnel/vouch:<tag> --format '{{ json .SBOM }}'`).
+
+The image runs as a non-root user, listens on 8080 and logs JSON. Mount your configuration over
+`/app/vouch.yml` and the service account's password file next to it. `/var/log/vouch` is a volume
+writable by the image's user, for the file audit sink (`audit.file.path:
+/var/log/vouch/audit.log`):
 
 ```sh
 docker run -d --name vouch -p 8080:8080 \
   -v "$PWD/vouch.yml:/app/vouch.yml:ro" \
   -v "$PWD/svc-vouch.password:/app/svc-vouch.password:ro" \
-  ghcr.io/wrouesnel/vouch:latest
+  -v vouch-audit:/var/log/vouch \
+  ghcr.io/wrouesnel/vouch:0.1.0
 ```
 
 Put it behind a TLS-terminating reverse proxy, and list the proxy's address in
 `web.trustedProxies` so presence checks and rate limits see the real client address.
 
-Every branch and pull request also builds the image without pushing it, so a broken
-Dockerfile fails CI. The build is `.github/workflows/container.yml`, called from
-`integration.yml` and `release.yml` once the tests have passed.
+### Releasing
+
+Push a version tag:
+
+```sh
+git tag -a v0.1.0 -m "vouch 0.1.0"
+git push github v0.1.0
+```
+
+`.github/workflows/release.yml` then runs the full CI suite, including the Samba integration
+tests. Only if that passes does it publish the versioned images (and move `latest`) and create
+the GitHub Release with the binary archives. A tag with a pre-release suffix such as
+`v0.2.0-rc.1` publishes `0.2.0-rc.1` without moving `latest`.
+
+Every branch and pull request also builds the image without pushing it, so a broken Dockerfile
+fails CI, and each push to `main` that passes CI publishes `main` and `sha-<commit>`. The image
+build is `.github/workflows/container.yml`, called from `integration.yml` and `release.yml`.
 
 ## Development
 

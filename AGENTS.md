@@ -57,6 +57,12 @@ model before changing `pkg/unlock`.
   `unlock_authorized` and only unlocks if it returns nil. A sink's `Log` must block until the
   event is durably committed. Audit sinks live in `pkg/audit`; the SQL sink's drivers are
   registered in `pkg/audit/drivers.go` (keep them pure-Go so the binary stays CGO-free).
+* The service account's permissions are granted by `extras/Grant-VouchServiceAccount.ps1` and,
+  identically, by `test/samba/setup.sh`. If vouch starts reading or writing another attribute,
+  change both, the README's permission table, and `TestSambaServiceAccountIsLeastPrivilege`.
+  Check the script with PSScriptAnalyzer (`pwsh -c 'Invoke-ScriptAnalyzer extras'`).
+* Releases: push a `v*` tag to the `github` remote. `release.yml` runs CI, then publishes the
+  versioned image (moving `latest` unless it's a pre-release) and the GitHub Release.
 
 * The API is defined in `api/vouch.yaml`. After changing it, run `go generate ./pkg/api` and
   commit `pkg/api/api.gen.go`. The generate directive pins the oapi-codegen version with

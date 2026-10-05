@@ -39,6 +39,15 @@ const (
 	DefaultRateWindow      = 15 * time.Minute
 )
 
+// DefaultDisableDescription is written to an account's description when vouch disables it.
+const DefaultDisableDescription = "Disabled by vouch on {date}: {reason} (audit session {session})"
+
+// NoDisableDescription, as Policy.DisableDescription, leaves descriptions unchanged.
+const NoDisableDescription = "-"
+
+// relockFailedReason explains a fail-safe disable.
+const relockFailedReason = "it could not be re-locked after its password was checked during a self-service unlock"
+
 // Policy decides who may vouch, who may be unlocked, and how long each step may take.
 type Policy struct {
 	// VoucherGroups are the DNs of groups whose members, directly or through nested groups, may
@@ -58,6 +67,13 @@ type Policy struct {
 	AllowClientIPChange bool `yaml:"allowClientIPChange"`
 	// RateLimit caps failed attempts per client address and per account.
 	RateLimit RateLimitConfig `yaml:"rateLimit"`
+	// DisableDescription is written to an account's description when vouch disables it, so
+	// whoever finds it disabled can see when and why. Placeholders: {date} (UTC, RFC 3339),
+	// {reason}, {session} (the audit session id, to find the audit records), {voucher},
+	// {target} and {previous} (the account's description before). Empty means
+	// DefaultDisableDescription; NoDisableDescription ("-") leaves the description unchanged.
+	// The result is truncated to AD's 1024-character limit.
+	DisableDescription string `yaml:"disableDescription"`
 }
 
 // Stage is where a session is in the workflow.
@@ -186,6 +202,9 @@ func NewService(dir directory.Directory, policy Policy, sink audit.Sink, opts ..
 	}
 	if policy.RateLimit.Attempts == 0 && policy.RateLimit.Window == 0 {
 		policy.RateLimit = RateLimitConfig{Attempts: DefaultRateAttempts, Window: DefaultRateWindow}
+	}
+	if policy.DisableDescription == "" {
+		policy.DisableDescription = DefaultDisableDescription
 	}
 	if sink == nil {
 		sink = audit.Nop{}
@@ -605,13 +624,17 @@ func (s *Service) Claim(ctx context.Context, sessionID string, client Client, us
 
 	// The account is locked and eligible. Unlock briefly, verify the password, and re-lock.
 	pw := []byte(password)
-	result, err := s.dir.VerifyWhileLocked(ctx, user, pw)
+	failsafe := s.disableDescription(sess, user, relockFailedReason)
+	result, err := s.dir.VerifyWhileLocked(ctx, user, pw, failsafe)
 	zeroBytes(pw)
 	if errors.Is(err, directory.ErrRelockFailed) {
 		log.Error("Could not re-lock account after verifying; it was disabled as a safeguard", zap.Error(err))
 		e := s.event(sess, "relock_failed", audit.DecisionFailure)
 		e.Reason = err.Error()
 		e.Message = "account could not be re-locked after verification and was disabled"
+		if failsafe != "" {
+			e.Message += "; description set to: " + failsafe
+		}
 		s.emit(ctx, sess, e)
 		sess.finish(OutcomeIneligible,
 			"Something went wrong unlocking this account and it has been secured. Please contact the service desk.")
@@ -735,6 +758,26 @@ func (s *Service) Confirm(ctx context.Context, sessionID string, client Client,
 	s.emit(ctx, sess, s.event(sess, "unlock", audit.DecisionSuccess))
 	sess.finish(OutcomeUnlocked, "The account is unlocked. The user can sign in now.")
 	return sess.state(), nil
+}
+
+// disableDescription renders Policy.DisableDescription for target, or "" if descriptions are
+// to be left alone.
+func (s *Service) disableDescription(sess *session, target *directory.User, reason string) string {
+	if s.policy.DisableDescription == NoDisableDescription {
+		return ""
+	}
+	voucher := ""
+	if sess.voucher != nil {
+		voucher = sess.voucher.SAMAccountName
+	}
+	return directory.TruncateDescription(strings.NewReplacer(
+		"{date}", s.now().UTC().Format(time.RFC3339),
+		"{reason}", reason,
+		"{session}", sess.auditID,
+		"{voucher}", voucher,
+		"{target}", target.SAMAccountName,
+		"{previous}", target.Description,
+	).Replace(s.policy.DisableDescription))
 }
 
 // zeroBytes overwrites b, to limit how long a password lingers in memory.

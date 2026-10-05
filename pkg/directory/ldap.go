@@ -346,9 +346,12 @@ func (d *LDAP) lockoutThreshold(conn *ldap.Conn, user *User) (int, error) {
 		if err != nil {
 			return 0, fmt.Errorf("reading PSO lockout threshold: %w", err)
 		}
-		if ok {
-			threshold = value
+		if !ok {
+			// Falling back to the domain threshold here could leave the account short of its
+			// real threshold, so refuse before anything is unlocked.
+			return 0, fmt.Errorf("%w: %s", ErrPSOUnreadable, pso)
 		}
+		threshold = value
 	}
 	if threshold == 0 {
 		domain := domainDN(user.DN)
@@ -421,7 +424,7 @@ func randomWrongPassword() string {
 }
 
 // VerifyWhileLocked implements Directory.
-func (d *LDAP) VerifyWhileLocked(ctx context.Context, user *User, password []byte) (BindResult, error) {
+func (d *LDAP) VerifyWhileLocked(ctx context.Context, user *User, password []byte, failsafeDescription string) (BindResult, error) {
 	conn, rawURL, err := d.serviceConn(ctx, "")
 	if err != nil {
 		return BindFailed, err
@@ -448,7 +451,11 @@ func (d *LDAP) VerifyWhileLocked(ctx context.Context, user *User, password []byt
 		// unconfirmed account can't be used, and make the failure loud.
 		logutil.FromCtx(ctx).Error("Could not re-lock account after verification; disabling it",
 			zap.String("dn", user.DN), zap.Error(err))
-		if derr := d.disableOnConn(conn, user); derr != nil {
+		derr := d.disableOnConn(conn, user, failsafeDescription)
+		if errors.Is(derr, ErrDescriptionNotSet) {
+			return BindFailed, fmt.Errorf("%w: account disabled as a safeguard (%w)", ErrRelockFailed, derr)
+		}
+		if derr != nil {
 			return BindFailed, fmt.Errorf("%w; and disabling failed: %w", ErrRelockFailed, derr)
 		}
 		return BindFailed, fmt.Errorf("%w: account disabled as a safeguard", ErrRelockFailed)
@@ -461,18 +468,19 @@ func (d *LDAP) VerifyWhileLocked(ctx context.Context, user *User, password []byt
 }
 
 // Disable implements Directory.
-func (d *LDAP) Disable(ctx context.Context, user *User) error {
+func (d *LDAP) Disable(ctx context.Context, user *User, description string) error {
 	conn, _, err := d.serviceConn(ctx, "")
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
-	return d.disableOnConn(conn, user)
+	return d.disableOnConn(conn, user, description)
 }
 
-// disableOnConn sets UF_ACCOUNTDISABLE on the connection, which must be bound as the service
-// account.
-func (d *LDAP) disableOnConn(conn *ldap.Conn, user *User) error {
+// disableOnConn sets UF_ACCOUNTDISABLE, and the description if it's not empty, over the
+// connection, which must be bound as the service account. Both change in one modify, so the
+// account is never disabled without its explanation.
+func (d *LDAP) disableOnConn(conn *ldap.Conn, user *User, description string) error {
 	// Re-read userAccountControl so other flags changed since lookup aren't overwritten.
 	result, err := conn.Search(ldap.NewSearchRequest(user.DN, ldap.ScopeBaseObject,
 		ldap.NeverDerefAliases, 1, int(d.cfg.Timeout.Seconds()), false, "(objectClass=*)",
@@ -488,10 +496,25 @@ func (d *LDAP) disableOnConn(conn *ldap.Conn, user *User) error {
 		return fmt.Errorf("parsing userAccountControl: %w", err)
 	}
 
+	disabled := strconv.FormatInt(uac|uacAccountDisable, 10)
 	modify := ldap.NewModifyRequest(user.DN, nil)
-	modify.Replace("userAccountControl", []string{strconv.FormatInt(uac|uacAccountDisable, 10)})
+	modify.Replace("userAccountControl", []string{disabled})
+	if description = TruncateDescription(description); description != "" {
+		modify.Replace("description", []string{description})
+	}
+	err = conn.Modify(modify)
+	if err == nil {
+		return nil
+	}
+	if description == "" || !ldap.IsErrorWithCode(err, ldap.LDAPResultInsufficientAccessRights) {
+		return fmt.Errorf("disabling account: %w", err)
+	}
+	// The service account may lack write access to description. Disabling matters more than
+	// explaining it, so disable without the description and report that it's missing.
+	modify = ldap.NewModifyRequest(user.DN, nil)
+	modify.Replace("userAccountControl", []string{disabled})
 	if err := conn.Modify(modify); err != nil {
 		return fmt.Errorf("disabling account: %w", err)
 	}
-	return nil
+	return fmt.Errorf("%w: %w", ErrDescriptionNotSet, err)
 }

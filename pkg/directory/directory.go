@@ -20,6 +20,16 @@ var ErrUserNotFound = errors.New("user not found")
 // VerifyWhileLocked. The account is disabled as a safeguard before this is returned.
 var ErrRelockFailed = errors.New("could not re-lock account")
 
+// ErrPSOUnreadable is returned (wrapped) when a fine-grained password policy applies to the
+// account but the service account can't read its lockout threshold. vouch then refuses to
+// unlock the account, rather than guess the threshold. Grant read access to msDS-LockoutThreshold
+// on password-settings objects (extras/Grant-VouchServiceAccount.ps1 does this).
+var ErrPSOUnreadable = errors.New("cannot read the lockout threshold of the account's password settings object")
+
+// ErrDescriptionNotSet is returned (wrapped) by Disable when the account was disabled but its
+// description couldn't be written. The account is disabled; only the explanation is missing.
+var ErrDescriptionNotSet = errors.New("account disabled, but its description could not be set")
+
 // ErrLockoutNotConfigured is returned when the account's effective lockout threshold is zero,
 // so it can't be re-locked by failing binds. Such an account can't become locked by policy
 // in the first place.
@@ -108,6 +118,10 @@ func ClassifyBindError(err error) (BindResult, error) {
 const (
 	uacAccountDisable = 0x2
 )
+
+// MaxDescriptionLength is the longest description AD accepts on a user (rangeUpper of the
+// description attribute).
+const MaxDescriptionLength = 1024
 
 // ufLockout is the UF_LOCKOUT bit in msDS-User-Account-Control-Computed. It's set when the
 // account is currently locked out.
@@ -212,10 +226,21 @@ type Directory interface {
 	// account, all against one domain controller. The caller must have already confirmed the
 	// account is locked, or an innocent account could be locked by the re-lock. On return the
 	// account is locked again; if it could not be re-locked the account is disabled as a
-	// safeguard and an error wrapping ErrRelockFailed is returned.
-	VerifyWhileLocked(ctx context.Context, user *User, password []byte) (BindResult, error)
+	// safeguard, its description is set to failsafeDescription (if not empty), and an error
+	// wrapping ErrRelockFailed is returned.
+	VerifyWhileLocked(ctx context.Context, user *User, password []byte, failsafeDescription string) (BindResult, error)
 	// Unlock clears the account's lockout. This is the final, permanent unlock.
 	Unlock(ctx context.Context, user *User) error
-	// Disable disables the account.
-	Disable(ctx context.Context, user *User) error
+	// Disable disables the account, and sets its description to description if that's not
+	// empty, so whoever finds it disabled can see why.
+	Disable(ctx context.Context, user *User, description string) error
+}
+
+// TruncateDescription trims description to MaxDescriptionLength characters.
+func TruncateDescription(description string) string {
+	runes := []rune(description)
+	if len(runes) <= MaxDescriptionLength {
+		return description
+	}
+	return string(runes[:MaxDescriptionLength-1]) + "…"
 }

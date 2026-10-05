@@ -197,7 +197,7 @@ func (f *Fake) IsMemberOfAny(_ context.Context, user *directory.User, groupDNs [
 }
 
 // UnlockAndVerify implements directory.Directory.
-func (f *Fake) VerifyWhileLocked(_ context.Context, user *directory.User, password []byte) (directory.BindResult, error) {
+func (f *Fake) VerifyWhileLocked(_ context.Context, user *directory.User, password []byte, failsafeDescription string) (directory.BindResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.Err != nil {
@@ -209,6 +209,9 @@ func (f *Fake) VerifyWhileLocked(_ context.Context, user *directory.User, passwo
 		found := f.byDN(user.DN)
 		if found != nil {
 			found.User.UserAccountControl |= 0x2
+			if failsafeDescription != "" {
+				found.User.Description = directory.TruncateDescription(failsafeDescription)
+			}
 		}
 		return directory.BindFailed, fmt.Errorf("%w: account disabled as a safeguard", directory.ErrRelockFailed)
 	}
@@ -250,7 +253,7 @@ func (f *Fake) Unlock(_ context.Context, user *directory.User) error {
 }
 
 // Disable implements directory.Directory.
-func (f *Fake) Disable(_ context.Context, user *directory.User) error {
+func (f *Fake) Disable(_ context.Context, user *directory.User, description string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.Err != nil {
@@ -261,5 +264,8 @@ func (f *Fake) Disable(_ context.Context, user *directory.User) error {
 		return directory.ErrUserNotFound
 	}
 	found.User.UserAccountControl |= 0x2
+	if description != "" {
+		found.User.Description = directory.TruncateDescription(description)
+	}
 	return nil
 }

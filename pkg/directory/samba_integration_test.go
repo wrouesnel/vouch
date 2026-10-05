@@ -1,29 +1,38 @@
+// Samba generates its self-signed LDAPS certificate with a random serial number, which is
+// sometimes negative. Go rejects those by default; real AD certificates don't have them.
+//go:debug x509negativeserial=1
+
 package directory_test
 
 import (
 	"context"
+	"crypto/tls"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/go-ldap/ldap/v3"
 	"github.com/wrouesnel/vouch/pkg/audit"
 	"github.com/wrouesnel/vouch/pkg/directory"
 	"github.com/wrouesnel/vouch/pkg/unlock"
+	"golang.org/x/text/encoding/unicode"
 )
 
 // These tests run against the Samba AD DC from test/samba. Start it with test/samba/start.sh
 // and set VOUCH_SAMBA_URL=ldap://127.0.0.1:10389 to run them.
 
 const (
-	sambaBase       = "DC=vouch,DC=test"
-	sambaUsers      = "CN=Users," + sambaBase
-	sambaAdminDN    = "CN=Administrator," + sambaUsers
-	sambaAdminPass  = "Admin-Passw0rd!"
-	sambaHelpdesk   = "CN=Helpdesk," + sambaUsers
-	sambaProtected  = "CN=Protected-Users-Vouch," + sambaUsers
-	sambaThreshold  = 3
-	sambaWrongPass  = "definitely-wrong"
-	sambaPassPrefix = "Passw0rd-"
+	sambaBase      = "DC=vouch,DC=test"
+	sambaUsers     = "CN=Users," + sambaBase
+	sambaAdminDN   = "CN=Administrator," + sambaUsers
+	sambaAdminPass = "Admin-Passw0rd!"
+	sambaHelpdesk  = "CN=Helpdesk," + sambaUsers
+	sambaProtected = "CN=Protected-Users-Vouch," + sambaUsers
+	sambaThreshold = 3
+	// sambaPSOThreshold is vouch-test-pso's threshold, applied to erin by setup.sh.
+	sambaPSOThreshold = 5
+	sambaWrongPass    = "definitely-wrong"
+	sambaPassPrefix   = "Passw0rd-"
 )
 
 func sambaPassword(name string) string { return sambaPassPrefix + name + "!" }
@@ -72,6 +81,7 @@ func resetUser(t *testing.T, name string) {
 		modify := ldap.NewModifyRequest("CN="+name+","+sambaUsers, nil)
 		modify.Replace("lockoutTime", []string{"0"})
 		modify.Replace("userAccountControl", []string{"512"})
+		modify.Replace("description", []string{})
 		if err := conn.Modify(modify); err != nil {
 			t.Fatalf("resetting %s: %v", name, err)
 		}
@@ -81,8 +91,14 @@ func resetUser(t *testing.T, name string) {
 // lockOut locks a user by binding with a wrong password until AD locks the account.
 func lockOut(t *testing.T, dir directory.Directory, user *directory.User) {
 	t.Helper()
+	lockOutAfter(t, dir, user, sambaThreshold)
+}
+
+// lockOutAfter locks a user whose lockout threshold is threshold.
+func lockOutAfter(t *testing.T, dir directory.Directory, user *directory.User, threshold int) {
+	t.Helper()
 	ctx := context.Background()
-	for range sambaThreshold {
+	for range threshold {
 		if _, err := dir.Authenticate(ctx, user, []byte(sambaWrongPass)); err != nil {
 			t.Fatal(err)
 		}
@@ -151,7 +167,7 @@ func TestSambaDirectory(t *testing.T) {
 
 	t.Run("verify while locked re-locks the account", func(t *testing.T) {
 		// Correct password: verified, and the account is locked again afterwards.
-		result, err := dir.VerifyWhileLocked(ctx, alice, []byte(sambaPassword("alice")))
+		result, err := dir.VerifyWhileLocked(ctx, alice, []byte(sambaPassword("alice")), "")
 		if err != nil || result != directory.BindOK {
 			t.Fatalf("verify with correct password: %v %v", result, err)
 		}
@@ -160,7 +176,7 @@ func TestSambaDirectory(t *testing.T) {
 		}
 
 		// Wrong password: not verified, still locked.
-		result, err = dir.VerifyWhileLocked(ctx, alice, []byte(sambaWrongPass))
+		result, err = dir.VerifyWhileLocked(ctx, alice, []byte(sambaWrongPass), "")
 		if err != nil || result != directory.BindInvalidCredentials {
 			t.Fatalf("verify with wrong password: %v %v", result, err)
 		}
@@ -183,8 +199,12 @@ func TestSambaDirectory(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := dir.Disable(ctx, carol); err != nil {
+		const description = "Disabled by vouch on 2026-01-01T00:00:00Z: integration test"
+		if err := dir.Disable(ctx, carol, description); err != nil {
 			t.Fatal(err)
+		}
+		if reread, err := dir.LookupDN(ctx, carol.DN); err != nil || reread.Description != description {
+			t.Fatalf("description after disable: %q, %v", reread.Description, err)
 		}
 		result, err := dir.Authenticate(ctx, carol, []byte(sambaPassword("carol")))
 		if err != nil || result != directory.BindDisabled {
@@ -253,4 +273,95 @@ func TestSambaWorkflow(t *testing.T) {
 			t.Fatalf("dadmin must stay locked: %v", result)
 		}
 	})
+}
+
+// TestSambaPasswordSettingsObject checks the lockout threshold is taken from a fine-grained
+// password policy. setup.sh applies vouch-test-pso (threshold 5, above the domain's 3) to erin.
+func TestSambaPasswordSettingsObject(t *testing.T) {
+	dir := sambaDirectory(t)
+	ctx := context.Background()
+	resetUser(t, "erin")
+	t.Cleanup(func() { resetUser(t, "erin") })
+
+	erin, err := dir.LookupUser(ctx, "erin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockOutAfter(t, dir, erin, sambaPSOThreshold)
+
+	result, err := dir.VerifyWhileLocked(ctx, erin, []byte(sambaPassword("erin")), "")
+	if err != nil || result != directory.BindOK {
+		t.Fatalf("verify with correct password: %v %v", result, err)
+	}
+	if r, _ := dir.Authenticate(ctx, erin, []byte(sambaPassword("erin"))); r != directory.BindLockedOut {
+		t.Fatalf("erin should be re-locked using the PSO's threshold: %v", r)
+	}
+	if reread, err := dir.LookupDN(ctx, erin.DN); err != nil || reread.Disabled() {
+		t.Fatalf("erin must not have been disabled by the fail-safe: %v", err)
+	}
+}
+
+// TestSambaServiceAccountIsLeastPrivilege checks svc-vouch can't change anything beyond the
+// attributes it's been granted, using the same permission set as
+// extras/Grant-VouchServiceAccount.ps1.
+func TestSambaServiceAccountIsLeastPrivilege(t *testing.T) {
+	url := sambaURL(t)
+	conn, err := ldap.DialURL(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.Bind("CN=svc-vouch,"+sambaUsers, sambaPassword("svc-vouch")); err != nil {
+		t.Fatal(err)
+	}
+
+	denied := map[string]*ldap.ModifyRequest{}
+	title := ldap.NewModifyRequest("CN=carol,"+sambaUsers, nil)
+	title.Replace("title", []string{"Changed by svc-vouch"})
+	denied["write another attribute"] = title
+	member := ldap.NewModifyRequest(sambaHelpdesk, nil)
+	member.Add("member", []string{"CN=svc-vouch," + sambaUsers})
+	denied["join a voucher group"] = member
+	pso := ldap.NewModifyRequest("CN=vouch-test-pso,CN=Password Settings Container,CN=System,"+sambaBase, nil)
+	pso.Replace("msDS-LockoutThreshold", []string{"0"})
+	denied["change a password policy"] = pso
+	domain := ldap.NewModifyRequest(sambaBase, nil)
+	domain.Replace("lockoutThreshold", []string{"0"})
+	denied["change the domain lockout policy"] = domain
+
+	for name, modify := range denied {
+		if err := conn.Modify(modify); !ldap.IsErrorWithCode(err, ldap.LDAPResultInsufficientAccessRights) {
+			t.Errorf("%s: got %v, want insufficient access", name, err)
+		}
+	}
+
+	// Password resets need the Reset Password extended right, which isn't granted. AD only
+	// accepts unicodePwd over an encrypted connection, so use LDAPS.
+	if err := resetPassword(t, sambaAdminDN, sambaAdminPass, "carol"); err != nil {
+		t.Fatalf("Administrator should be able to reset a password, so the check below is meaningful: %v", err)
+	}
+	if err := resetPassword(t, "CN=svc-vouch,"+sambaUsers, sambaPassword("svc-vouch"), "carol"); !ldap.IsErrorWithCode(err, ldap.LDAPResultInsufficientAccessRights) {
+		t.Errorf("reset a password: got %v, want insufficient access", err)
+	}
+}
+
+// resetPassword sets name's password by replacing unicodePwd over LDAPS, bound as bindDN.
+func resetPassword(t *testing.T, bindDN, bindPassword, name string) error {
+	t.Helper()
+	conn, err := ldap.DialURL(strings.Replace(strings.Replace(sambaURL(t), "ldap://", "ldaps://", 1), ":10389", ":10636", 1),
+		ldap.DialWithTLSConfig(&tls.Config{InsecureSkipVerify: true})) //nolint:gosec // self-signed test DC
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.Bind(bindDN, bindPassword); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := unicode.UTF16(unicode.LittleEndian, unicode.IgnoreBOM).NewEncoder().String(`"` + sambaPassword(name) + `"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	modify := ldap.NewModifyRequest("CN="+name+","+sambaUsers, nil)
+	modify.Replace("unicodePwd", []string{encoded})
+	return conn.Modify(modify)
 }
