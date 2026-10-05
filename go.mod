@@ -15,7 +15,7 @@ require (
 	github.com/mholt/archiver v3.1.1+incompatible
 	github.com/pkg/errors v0.9.1
 	github.com/samber/lo v1.53.0
-	github.com/spf13/afero v1.14.0
+	github.com/spf13/afero v1.15.0
 	github.com/wrouesnel/ctxstdio v0.0.0-20260925000958-306c83092f60
 	github.com/wrouesnel/go.logutil v0.0.0-20260831004131-2c91cc3e879a
 	github.com/wrouesnel/kongutil v0.0.0-20261002155125-2b34e3bf1495
