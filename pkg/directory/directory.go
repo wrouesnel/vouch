@@ -123,6 +123,9 @@ const (
 // description attribute).
 const MaxDescriptionLength = 1024
 
+// MaxLockoutThreshold is the largest account lockout threshold AD allows.
+const MaxLockoutThreshold = 999
+
 // ufLockout is the UF_LOCKOUT bit in msDS-User-Account-Control-Computed. It's set when the
 // account is currently locked out.
 const ufLockout = 0x10

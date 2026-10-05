@@ -352,8 +352,8 @@ func (d *LDAP) lockoutThreshold(conn *ldap.Conn, user *User) (int, error) {
 			return 0, fmt.Errorf("%w: %s", ErrPSOUnreadable, pso)
 		}
 		threshold = value
-	}
-	if threshold == 0 {
+	} else {
+		// A PSO, when one applies, takes precedence even if its threshold is 0.
 		domain := domainDN(user.DN)
 		if domain == "" {
 			domain = d.cfg.BaseDN
@@ -368,6 +368,10 @@ func (d *LDAP) lockoutThreshold(conn *ldap.Conn, user *User) (int, error) {
 	}
 	if threshold <= 0 {
 		return 0, ErrLockoutNotConfigured
+	}
+	// AD caps the threshold at 999. Refuse anything larger rather than make that many binds.
+	if threshold > MaxLockoutThreshold {
+		return 0, fmt.Errorf("lockout threshold %d is above AD's maximum of %d", threshold, MaxLockoutThreshold)
 	}
 	return int(threshold), nil
 }
