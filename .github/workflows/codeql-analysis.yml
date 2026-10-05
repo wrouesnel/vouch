@@ -41,8 +41,13 @@ jobs:
           build-mode: manual
           # queries: security-extended,security-and-quality
 
+      # CodeQL's Go tracer doesn't see the compiler invocations mage makes, so build with plain
+      # `go build`. The generated API code and the web/dist placeholder are committed, so this
+      # needs neither mage's tools nor Node.
       - name: Build
-        run: go run mage.go binary
+        env:
+          CGO_ENABLED: "0"
+        run: go build ./...
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
