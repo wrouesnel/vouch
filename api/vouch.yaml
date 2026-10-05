@@ -101,7 +101,7 @@ paths:
       description: |
         The voucher must re-enter the credentials of the account that started the session.
         The account is then unlocked and the password given in step 2 is verified against it.
-        The response is `complete` with outcome `unlocked` or `verification_failed`.
+        The response is `complete` with outcome `unlocked`.
       requestBody:
         required: true
         content:
@@ -181,11 +181,10 @@ components:
       enum: [start, awaiting_claim, awaiting_confirmation, complete]
     Outcome:
       type: string
-      enum: [not_locked, unlocked, verification_failed, ineligible]
+      enum: [not_locked, unlocked, ineligible]
       description: |
         * `not_locked` - the password works, so the account isn't locked.
-        * `unlocked` - the account was unlocked and the password verified.
-        * `verification_failed` - the account was unlocked but the password from step 2 was wrong.
+        * `unlocked` - the account's lockout was cleared after the voucher confirmed.
         * `ineligible` - this account can't be unlocked by self-service.
     Account:
       type: object
@@ -249,5 +248,6 @@ components:
             - voucher_mismatch
             - attestation_required
             - directory_error
+            - audit_failed
         message:
           type: string

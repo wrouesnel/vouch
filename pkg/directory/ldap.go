@@ -2,8 +2,10 @@ package directory
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -258,23 +260,204 @@ func (d *LDAP) IsMemberOfAny(ctx context.Context, user *User, groupDNs []string)
 	return len(result.Entries) > 0, nil
 }
 
-// UnlockAndVerify implements Directory. Both operations go to the same domain controller, so
-// the password check sees the cleared lockout without waiting for replication.
-func (d *LDAP) UnlockAndVerify(ctx context.Context, user *User, password []byte) (BindResult, error) {
+// clearLockout clears lockoutTime on the connection, which must be bound as the service account.
+func clearLockout(conn *ldap.Conn, user *User) error {
+	modify := ldap.NewModifyRequest(user.DN, nil)
+	modify.Replace("lockoutTime", []string{"0"})
+	if err := conn.Modify(modify); err != nil {
+		return fmt.Errorf("clearing lockoutTime: %w", err)
+	}
+	return nil
+}
+
+// Unlock implements Directory.
+func (d *LDAP) Unlock(ctx context.Context, user *User) error {
+	conn, rawURL, err := d.serviceConn(ctx, "")
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if err := clearLockout(conn, user); err != nil {
+		return err
+	}
+	logutil.FromCtx(ctx).Info("Cleared account lockout", zap.String("dn", user.DN), zap.String("url", rawURL))
+	return nil
+}
+
+// isLockedOut reads msDS-User-Account-Control-Computed over conn and reports whether the
+// account is currently locked.
+func (d *LDAP) isLockedOut(conn *ldap.Conn, user *User) (bool, error) {
+	result, err := conn.Search(ldap.NewSearchRequest(user.DN, ldap.ScopeBaseObject,
+		ldap.NeverDerefAliases, 1, int(d.cfg.Timeout.Seconds()), false, "(objectClass=*)",
+		[]string{"msDS-User-Account-Control-Computed"}, nil))
+	if err != nil {
+		return false, fmt.Errorf("reading lockout state: %w", err)
+	}
+	if len(result.Entries) != 1 {
+		return false, ErrUserNotFound
+	}
+	computed, err := strconv.ParseInt(result.Entries[0].GetAttributeValue("msDS-User-Account-Control-Computed"), 10, 64)
+	if err != nil {
+		return false, fmt.Errorf("parsing msDS-User-Account-Control-Computed: %w", err)
+	}
+	return computed&ufLockout != 0, nil
+}
+
+// domainDN returns the domain's distinguished name, i.e. the trailing DC= components of dn.
+func domainDN(dn string) string {
+	var parts []string
+	for _, rdn := range strings.Split(dn, ",") {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(rdn)), "dc=") {
+			parts = append(parts, strings.TrimSpace(rdn))
+		}
+	}
+	return strings.Join(parts, ",")
+}
+
+// lockoutThreshold reads the account's effective lockout threshold: its fine-grained password
+// policy (msDS-ResultantPSO) if it has one, otherwise the domain's lockoutThreshold. A zero
+// threshold (lockout disabled) returns ErrLockoutNotConfigured.
+func (d *LDAP) lockoutThreshold(conn *ldap.Conn, user *User) (int, error) {
+	readInt := func(dn, attr string) (int64, bool, error) {
+		result, err := conn.Search(ldap.NewSearchRequest(dn, ldap.ScopeBaseObject,
+			ldap.NeverDerefAliases, 1, int(d.cfg.Timeout.Seconds()), false, "(objectClass=*)",
+			[]string{attr}, nil))
+		if err != nil {
+			return 0, false, err
+		}
+		if len(result.Entries) != 1 {
+			return 0, false, nil
+		}
+		raw := result.Entries[0].GetAttributeValue(attr)
+		if raw == "" {
+			return 0, false, nil
+		}
+		value, err := strconv.ParseInt(raw, 10, 64)
+		return value, err == nil, err
+	}
+
+	var threshold int64
+	pso, _, err := readPSO(conn, user, d.cfg.Timeout)
+	if err != nil {
+		return 0, err
+	}
+	if pso != "" {
+		value, ok, err := readInt(pso, "msDS-LockoutThreshold")
+		if err != nil {
+			return 0, fmt.Errorf("reading PSO lockout threshold: %w", err)
+		}
+		if ok {
+			threshold = value
+		}
+	}
+	if threshold == 0 {
+		domain := domainDN(user.DN)
+		if domain == "" {
+			domain = d.cfg.BaseDN
+		}
+		value, ok, err := readInt(domain, "lockoutThreshold")
+		if err != nil {
+			return 0, fmt.Errorf("reading domain lockout threshold: %w", err)
+		}
+		if ok {
+			threshold = value
+		}
+	}
+	if threshold <= 0 {
+		return 0, ErrLockoutNotConfigured
+	}
+	return int(threshold), nil
+}
+
+// readPSO returns the DN of the account's resultant fine-grained password policy, or "" if it
+// has none.
+func readPSO(conn *ldap.Conn, user *User, timeout time.Duration) (string, bool, error) {
+	result, err := conn.Search(ldap.NewSearchRequest(user.DN, ldap.ScopeBaseObject,
+		ldap.NeverDerefAliases, 1, int(timeout.Seconds()), false, "(objectClass=*)",
+		[]string{"msDS-ResultantPSO"}, nil))
+	if err != nil {
+		return "", false, fmt.Errorf("reading msDS-ResultantPSO: %w", err)
+	}
+	if len(result.Entries) != 1 {
+		return "", false, nil
+	}
+	pso := result.Entries[0].GetAttributeValue("msDS-ResultantPSO")
+	return pso, pso != "", nil
+}
+
+// relock locks the account by binding with wrong passwords until it reaches its lockout
+// threshold. The account must be unlocked when this is called. rawURL and threshold come from
+// VerifyWhileLocked, which already read them against the same DC.
+func (d *LDAP) relock(ctx context.Context, conn *ldap.Conn, rawURL string, user *User, threshold int) error {
+	// A few extra attempts beyond the threshold cover a stray successful reset or an
+	// observation-window edge, without risking a runaway loop.
+	const extraAttempts = 5
+	for attempt := 0; attempt < threshold+extraAttempts; attempt++ {
+		if _, err := d.bindAs(rawURL, user, []byte(randomWrongPassword())); err != nil {
+			return fmt.Errorf("re-lock bind: %w", err)
+		}
+		if attempt+1 < threshold {
+			continue
+		}
+		locked, err := d.isLockedOut(conn, user)
+		if err != nil {
+			return err
+		}
+		if locked {
+			logutil.FromCtx(ctx).Info("Re-locked account",
+				zap.String("dn", user.DN), zap.Int("attempts", attempt+1))
+			return nil
+		}
+	}
+	return ErrRelockFailed
+}
+
+// randomWrongPassword returns a random string that won't match any real password. It's never
+// empty, so each bind reaches the directory and counts towards lockout.
+func randomWrongPassword() string {
+	buf := make([]byte, 24)
+	_, _ = rand.Read(buf) // crypto/rand.Read never returns an error
+	return "!x" + hex.EncodeToString(buf)
+}
+
+// VerifyWhileLocked implements Directory.
+func (d *LDAP) VerifyWhileLocked(ctx context.Context, user *User, password []byte) (BindResult, error) {
 	conn, rawURL, err := d.serviceConn(ctx, "")
 	if err != nil {
 		return BindFailed, err
 	}
 	defer conn.Close()
 
-	modify := ldap.NewModifyRequest(user.DN, nil)
-	modify.Replace("lockoutTime", []string{"0"})
-	if err := conn.Modify(modify); err != nil {
-		return BindFailed, fmt.Errorf("clearing lockoutTime: %w", err)
+	// Read how many failed binds re-lock the account before unlocking it, so a directory
+	// problem here can't leave the account unlocked.
+	threshold, err := d.lockoutThreshold(conn, user)
+	if err != nil {
+		return BindFailed, fmt.Errorf("determining lockout threshold: %w", err)
 	}
-	logutil.FromCtx(ctx).Info("Cleared account lockout", zap.String("dn", user.DN), zap.String("url", rawURL))
 
-	return d.bindAs(rawURL, user, password)
+	if err := clearLockout(conn, user); err != nil {
+		return BindFailed, err
+	}
+	logutil.FromCtx(ctx).Info("Temporarily cleared lockout to verify password",
+		zap.String("dn", user.DN), zap.String("url", rawURL))
+
+	result, verifyErr := d.bindAs(rawURL, user, password)
+
+	if err := d.relock(ctx, conn, rawURL, user, threshold); err != nil {
+		// The account is unlocked and we couldn't re-lock it. Disable it so a verified-but-
+		// unconfirmed account can't be used, and make the failure loud.
+		logutil.FromCtx(ctx).Error("Could not re-lock account after verification; disabling it",
+			zap.String("dn", user.DN), zap.Error(err))
+		if derr := d.disableOnConn(conn, user); derr != nil {
+			return BindFailed, fmt.Errorf("%w; and disabling failed: %w", ErrRelockFailed, derr)
+		}
+		return BindFailed, fmt.Errorf("%w: account disabled as a safeguard", ErrRelockFailed)
+	}
+
+	if verifyErr != nil {
+		return BindFailed, verifyErr
+	}
+	return result, nil
 }
 
 // Disable implements Directory.
@@ -284,7 +467,12 @@ func (d *LDAP) Disable(ctx context.Context, user *User) error {
 		return err
 	}
 	defer conn.Close()
+	return d.disableOnConn(conn, user)
+}
 
+// disableOnConn sets UF_ACCOUNTDISABLE on the connection, which must be bound as the service
+// account.
+func (d *LDAP) disableOnConn(conn *ldap.Conn, user *User) error {
 	// Re-read userAccountControl so other flags changed since lookup aren't overwritten.
 	result, err := conn.Search(ldap.NewSearchRequest(user.DN, ldap.ScopeBaseObject,
 		ldap.NeverDerefAliases, 1, int(d.cfg.Timeout.Seconds()), false, "(objectClass=*)",

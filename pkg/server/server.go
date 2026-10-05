@@ -214,6 +214,7 @@ var unlockStatus = map[unlock.Code]int{
 	unlock.CodeVoucherMismatch:      http.StatusForbidden,
 	unlock.CodeAttestationRequired:  http.StatusBadRequest,
 	unlock.CodeDirectoryError:       http.StatusBadGateway,
+	unlock.CodeAuditFailed:          http.StatusServiceUnavailable,
 }
 
 // failure reports a workflow error.

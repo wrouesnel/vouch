@@ -12,6 +12,7 @@ import (
 
 	"github.com/labstack/echo/v5"
 	"github.com/wrouesnel/vouch/pkg/api"
+	"github.com/wrouesnel/vouch/pkg/audit"
 	"github.com/wrouesnel/vouch/pkg/directory/directorytest"
 	"github.com/wrouesnel/vouch/pkg/server"
 	"github.com/wrouesnel/vouch/pkg/unlock"
@@ -34,7 +35,7 @@ func newServer(t *testing.T) (*echo.Echo, *directorytest.Fake) {
 	dir.Add("alice", "alice-password")
 	dir.Add("bob", "bob-password", helpdesk)
 	dir.Lock("alice")
-	svc, err := unlock.NewService(dir, unlock.Policy{VoucherGroups: []string{helpdesk}})
+	svc, err := unlock.NewService(dir, unlock.Policy{VoucherGroups: []string{helpdesk}}, audit.Nop{})
 	if err != nil {
 		t.Fatal(err)
 	}

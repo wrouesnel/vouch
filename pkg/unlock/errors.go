@@ -24,6 +24,7 @@ const (
 	CodeVoucherMismatch      Code = "voucher_mismatch"
 	CodeAttestationRequired  Code = "attestation_required"
 	CodeDirectoryError       Code = "directory_error"
+	CodeAuditFailed          Code = "audit_failed"
 )
 
 // Error is a failure the user can be told about. Err, if set, is the underlying cause, which
@@ -84,4 +85,13 @@ func errVoucherMismatch(voucher *directory.User) *Error {
 
 func errRateLimited() *Error {
 	return newError(CodeRateLimited, "Too many attempts. Please wait a while before trying again.")
+}
+
+func errAuditFailed(err error) *Error {
+	return &Error{
+		Code: CodeAuditFailed,
+		Message: "The unlock couldn't be recorded in the audit log, so it was not carried out. " +
+			"Please try again shortly or contact the service desk.",
+		Err: err,
+	}
 }

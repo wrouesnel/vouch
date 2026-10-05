@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/go-ldap/ldap/v3"
+	"github.com/wrouesnel/vouch/pkg/audit"
 	"github.com/wrouesnel/vouch/pkg/directory"
 	"github.com/wrouesnel/vouch/pkg/unlock"
 )
@@ -148,15 +149,32 @@ func TestSambaDirectory(t *testing.T) {
 		}
 	})
 
-	t.Run("unlock and verify", func(t *testing.T) {
-		result, err := dir.UnlockAndVerify(ctx, alice, []byte(sambaPassword("alice")))
+	t.Run("verify while locked re-locks the account", func(t *testing.T) {
+		// Correct password: verified, and the account is locked again afterwards.
+		result, err := dir.VerifyWhileLocked(ctx, alice, []byte(sambaPassword("alice")))
 		if err != nil || result != directory.BindOK {
-			t.Fatalf("unlock with correct password: %v %v", result, err)
+			t.Fatalf("verify with correct password: %v %v", result, err)
 		}
-		lockOut(t, dir, alice)
-		result, err = dir.UnlockAndVerify(ctx, alice, []byte(sambaWrongPass))
+		if r, _ := dir.Authenticate(ctx, alice, []byte(sambaPassword("alice"))); r != directory.BindLockedOut {
+			t.Fatalf("account should be re-locked after verifying: %v", r)
+		}
+
+		// Wrong password: not verified, still locked.
+		result, err = dir.VerifyWhileLocked(ctx, alice, []byte(sambaWrongPass))
 		if err != nil || result != directory.BindInvalidCredentials {
-			t.Fatalf("unlock with wrong password: %v %v", result, err)
+			t.Fatalf("verify with wrong password: %v %v", result, err)
+		}
+		if r, _ := dir.Authenticate(ctx, alice, []byte(sambaPassword("alice"))); r != directory.BindLockedOut {
+			t.Fatalf("account should still be locked: %v", r)
+		}
+	})
+
+	t.Run("unlock clears the lockout", func(t *testing.T) {
+		if err := dir.Unlock(ctx, alice); err != nil {
+			t.Fatal(err)
+		}
+		if r, _ := dir.Authenticate(ctx, alice, []byte(sambaPassword("alice"))); r != directory.BindOK {
+			t.Fatalf("account should be unlocked: %v", r)
 		}
 	})
 
@@ -186,7 +204,7 @@ func TestSambaWorkflow(t *testing.T) {
 	svc, err := unlock.NewService(dir, unlock.Policy{
 		VoucherGroups:   []string{sambaHelpdesk},
 		ProtectedGroups: []string{sambaProtected},
-	})
+	}, audit.Nop{})
 	if err != nil {
 		t.Fatal(err)
 	}

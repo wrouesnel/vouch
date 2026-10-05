@@ -41,6 +41,7 @@ func (c *clock) Advance(d time.Duration) {
 type fixture struct {
 	dir    *directorytest.Fake
 	svc    *unlock.Service
+	sink   *fakeSink
 	clock  *clock
 	client unlock.Client
 	ctx    context.Context
@@ -65,12 +66,13 @@ func newFixture(t *testing.T, mutate ...func(*unlock.Policy)) *fixture {
 		fn(&policy)
 	}
 	clk := &clock{now: time.Date(2026, 1, 1, 9, 0, 0, 0, time.UTC)}
-	svc, err := unlock.NewService(dir, policy, unlock.WithClock(clk.Now))
+	sink := newFakeSink()
+	svc, err := unlock.NewService(dir, policy, sink, unlock.WithClock(clk.Now))
 	if err != nil {
 		t.Fatal(err)
 	}
 	return &fixture{
-		dir: dir, svc: svc, clock: clk,
+		dir: dir, svc: svc, sink: sink, clock: clk,
 		client: unlock.Client{IP: "192.0.2.10", UserAgent: "Browser/1.0"},
 		ctx:    context.Background(),
 	}
@@ -121,6 +123,15 @@ func (f *fixture) confirm(sessionID string) (unlock.State, error) {
 func TestHappyPath(t *testing.T) {
 	f := newFixture(t)
 	sessionID := f.startAndClaim(t, alicePass)
+
+	// After the claim the account has been verified and re-locked, not left unlocked.
+	if !f.dir.Get("alice").Locked {
+		t.Fatal("alice should be re-locked after the claim, before confirmation")
+	}
+	if f.dir.Verifications != 1 || f.dir.Unlocks != 0 {
+		t.Fatalf("verifications=%d unlocks=%d, want 1 and 0", f.dir.Verifications, f.dir.Unlocks)
+	}
+
 	state, err := f.confirm(sessionID)
 	if err != nil {
 		t.Fatal(err)
@@ -129,13 +140,94 @@ func TestHappyPath(t *testing.T) {
 		t.Fatalf("got %+v", state)
 	}
 	if f.dir.Get("alice").Locked {
-		t.Fatal("alice should be unlocked")
+		t.Fatal("alice should be unlocked after confirmation")
 	}
+	if f.dir.Unlocks != 1 {
+		t.Fatalf("unlocks: got %d, want 1", f.dir.Unlocks)
+	}
+	// The unlock was authorised in the audit log before it happened.
+	if !f.sink.has("unlock_authorized") || !f.sink.has("unlock") {
+		t.Fatal("unlock should be audited")
+	}
+
 	// Replaying the confirmation does nothing.
 	_, err = f.confirm(sessionID)
 	wantCode(t, err, unlock.CodeWrongStage)
 	if f.dir.Unlocks != 1 {
 		t.Fatalf("unlocks: got %d, want 1", f.dir.Unlocks)
+	}
+}
+
+func TestUnlockIsGatedOnAudit(t *testing.T) {
+	f := newFixture(t)
+	f.sink.failTypes["unlock_authorized"] = true
+	sessionID := f.startAndClaim(t, alicePass)
+
+	_, err := f.confirm(sessionID)
+	wantCode(t, err, unlock.CodeAuditFailed)
+	if f.dir.Unlocks != 0 {
+		t.Fatal("the account must not be unlocked when the audit record can't be committed")
+	}
+	if f.dir.Get("alice").Locked != true {
+		t.Fatal("alice should still be locked")
+	}
+
+	// With the sink healthy again, the same session can complete.
+	f.sink.failTypes["unlock_authorized"] = false
+	state, err := f.confirm(sessionID)
+	if err != nil || state.Outcome != unlock.OutcomeUnlocked {
+		t.Fatalf("got %+v, %v", state, err)
+	}
+	if f.dir.Unlocks != 1 {
+		t.Fatalf("unlocks: got %d, want 1", f.dir.Unlocks)
+	}
+}
+
+func TestClaimVerifiesWithoutLeavingUnlocked(t *testing.T) {
+	f := newFixture(t)
+	sessionID := f.start(t)
+
+	// A wrong password at the claim leaves the account locked and lets the user retry.
+	_, err := f.svc.Claim(f.ctx, sessionID, f.client, "alice", "wrong")
+	wantCode(t, err, unlock.CodeInvalidCredentials)
+	if !f.dir.Get("alice").Locked {
+		t.Fatal("alice must stay locked after a wrong password")
+	}
+	state, err := f.svc.State(f.ctx, sessionID, f.client)
+	if err != nil || state.Stage != unlock.StageAwaitingClaim {
+		t.Fatalf("session should still be awaiting a claim: %+v, %v", state, err)
+	}
+
+	// The right password moves on, with the account re-locked.
+	state, err = f.svc.Claim(f.ctx, sessionID, f.client, "alice", alicePass)
+	if err != nil || state.Stage != unlock.StageAwaitingConfirmation {
+		t.Fatalf("got %+v, %v", state, err)
+	}
+	if !f.dir.Get("alice").Locked {
+		t.Fatal("alice should be re-locked after verification")
+	}
+	if f.dir.Unlocks != 0 {
+		t.Fatal("no permanent unlock should happen at the claim")
+	}
+}
+
+func TestRelockFailureDisablesAndStops(t *testing.T) {
+	f := newFixture(t)
+	f.dir.RelockErr = errors.New("re-lock impossible")
+	sessionID := f.start(t)
+
+	state, err := f.svc.Claim(f.ctx, sessionID, f.client, "alice", alicePass)
+	if err != nil || state.Outcome != unlock.OutcomeIneligible {
+		t.Fatalf("got %+v, %v", state, err)
+	}
+	if !f.dir.Get("alice").User.Disabled() {
+		t.Fatal("alice should be disabled as a safeguard when re-lock fails")
+	}
+	if !f.sink.has("relock_failed") {
+		t.Fatal("the re-lock failure should be audited")
+	}
+	if f.dir.Unlocks != 0 {
+		t.Fatal("no permanent unlock should happen")
 	}
 }
 
@@ -185,37 +277,13 @@ func TestClaimOutcomes(t *testing.T) {
 		t.Fatal("confirm must not be possible before a claim")
 	}
 
-	// An account whose password works isn't locked.
+	// An account whose password works isn't locked, so it isn't unlocked.
 	state, err = f.svc.Claim(f.ctx, sessionID, f.client, "carol", "carol-password")
 	if err != nil || state.Outcome != unlock.OutcomeNotLocked {
 		t.Fatalf("got %+v, %v", state, err)
 	}
-}
-
-func TestWrongPasswordIsOnlyDetectedAfterUnlock(t *testing.T) {
-	f := newFixture(t)
-	sessionID := f.startAndClaim(t, "not-alices-password")
-	state, err := f.confirm(sessionID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if state.Outcome != unlock.OutcomeVerificationFailed {
-		t.Fatalf("got %+v", state)
-	}
-	if f.dir.Get("alice").User.Disabled() {
-		t.Fatal("alice must not be disabled unless the policy says so")
-	}
-}
-
-func TestDisableOnFailedVerification(t *testing.T) {
-	f := newFixture(t, func(p *unlock.Policy) { p.DisableOnFailedVerification = true })
-	sessionID := f.startAndClaim(t, "not-alices-password")
-	state, err := f.confirm(sessionID)
-	if err != nil || state.Outcome != unlock.OutcomeVerificationFailed {
-		t.Fatalf("got %+v, %v", state, err)
-	}
-	if !f.dir.Get("alice").User.Disabled() {
-		t.Fatal("alice should be disabled")
+	if f.dir.Verifications != 0 {
+		t.Fatal("an unlocked account must never be unlocked-and-verified")
 	}
 }
 
@@ -227,8 +295,8 @@ func TestProtectedTargetIsIneligible(t *testing.T) {
 	if err != nil || state.Outcome != unlock.OutcomeIneligible {
 		t.Fatalf("got %+v, %v", state, err)
 	}
-	if f.dir.Unlocks != 0 {
-		t.Fatal("protected account must not be unlocked")
+	if f.dir.Verifications != 0 || f.dir.Unlocks != 0 {
+		t.Fatal("a protected account must never be unlocked, even briefly")
 	}
 }
 
@@ -238,6 +306,9 @@ func TestEligibleGroups(t *testing.T) {
 	state, err := f.svc.Claim(f.ctx, sessionID, f.client, "alice", alicePass)
 	if err != nil || state.Outcome != unlock.OutcomeIneligible {
 		t.Fatalf("got %+v, %v", state, err)
+	}
+	if f.dir.Verifications != 0 {
+		t.Fatal("an ineligible account must not be unlocked to verify")
 	}
 }
 
@@ -300,6 +371,9 @@ func TestPresenceEnforcement(t *testing.T) {
 			sessionID := f.start(t)
 			_, err := f.svc.Claim(f.ctx, sessionID, other, "alice", alicePass)
 			wantCode(t, err, unlock.CodePresenceMismatch)
+			if !f.sink.has("presence_mismatch") {
+				t.Fatal("a presence mismatch should be audited")
+			}
 			// The session is destroyed, even for the original browser.
 			_, err = f.svc.Claim(f.ctx, sessionID, f.client, "alice", alicePass)
 			wantCode(t, err, unlock.CodeNoSession)
@@ -372,13 +446,12 @@ func TestRateLimitCountsFailuresOnly(t *testing.T) {
 	}
 
 	// Another machine is still limited by the account, however it is named.
-	other := fixture{dir: f.dir, svc: f.svc, clock: f.clock, ctx: f.ctx,
-		client: unlock.Client{IP: "198.51.100.7", UserAgent: "x"}}
-	_, otherSession, err := f.svc.StartVouch(f.ctx, other.client, "bob", bobPass)
+	other := unlock.Client{IP: "198.51.100.7", UserAgent: "x"}
+	_, otherSession, err := f.svc.StartVouch(f.ctx, other, "bob", bobPass)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = f.svc.Claim(f.ctx, otherSession, other.client, "carol@example.test", "carol-password")
+	_, err = f.svc.Claim(f.ctx, otherSession, other, "carol@example.test", "carol-password")
 	wantCode(t, err, unlock.CodeRateLimited)
 
 	f.clock.Advance(time.Minute + time.Second)
@@ -392,6 +465,9 @@ func TestCancelAndSweep(t *testing.T) {
 	f := newFixture(t)
 	sessionID := f.start(t)
 	f.svc.Cancel(f.ctx, sessionID)
+	if !f.sink.has("session_cancelled") {
+		t.Fatal("a cancellation should be audited")
+	}
 	_, err := f.svc.Claim(f.ctx, sessionID, f.client, "alice", alicePass)
 	wantCode(t, err, unlock.CodeNoSession)
 
@@ -402,8 +478,23 @@ func TestCancelAndSweep(t *testing.T) {
 	wantCode(t, err, unlock.CodeNoSession)
 }
 
+func TestAuditTrailFields(t *testing.T) {
+	f := newFixture(t)
+	sessionID := f.startAndClaim(t, alicePass)
+	if _, err := f.confirm(sessionID); err != nil {
+		t.Fatal(err)
+	}
+	e, ok := f.sink.find("unlock_authorized")
+	if !ok {
+		t.Fatal("no unlock_authorized event")
+	}
+	if e.Target != "alice" || e.Voucher != "bob" || e.ClientIP != f.client.IP || e.Session == "" {
+		t.Fatalf("event missing fields: %+v", e)
+	}
+}
+
 func TestPolicyRequiresVoucherGroups(t *testing.T) {
-	if _, err := unlock.NewService(directorytest.NewFake(), unlock.Policy{}); err == nil {
+	if _, err := unlock.NewService(directorytest.NewFake(), unlock.Policy{}, nil); err == nil {
 		t.Fatal("a policy without voucher groups must be rejected")
 	}
 }

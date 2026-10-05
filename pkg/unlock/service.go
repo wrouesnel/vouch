@@ -4,15 +4,16 @@
 //
 //  1. Voucher: an authorised colleague signs in. They must be in a voucher group. This starts
 //     the session, bound to their browser.
-//  2. Claim: the locked-out user gives their username and password in that session. If binding
-//     as them says the account is locked, and it is eligible for self-service unlock, the
-//     password is held in memory and the user's details are shown to the voucher.
-//  3. Confirm: the voucher attests they are with the user in person and re-enters their own
-//     credentials. The account is unlocked and the password from step 2 is verified by binding
-//     as the user.
+//  2. Claim: the locked-out user gives their username and password. vouch confirms the account
+//     is really locked and is eligible, then briefly unlocks it, binds as the user to check the
+//     password, and re-locks it (see directory.VerifyWhileLocked). The account is left locked;
+//     no password is kept.
+//  3. Confirm: the voucher attests they are with the user and re-enters their own credentials.
+//     vouch commits an audit record and only then clears the lockout for good.
 //
-// AD won't say whether a password is right while the account is locked, so the password can
-// only be verified after the unlock, in step 3.
+// A locked account can't have its password checked without first unlocking it (AD answers every
+// bind "locked out"), so the check in step 2 unlocks and re-locks. The final unlock in step 3 is
+// gated on a committed audit record: if the audit sink can't commit, the account is not unlocked.
 package unlock
 
 import (
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	logutil "github.com/wrouesnel/go.logutil"
+	"github.com/wrouesnel/vouch/pkg/audit"
 	"github.com/wrouesnel/vouch/pkg/directory"
 	"go.uber.org/zap"
 )
@@ -47,9 +49,6 @@ type Policy struct {
 	ProtectedGroups []string `yaml:"protectedGroups"`
 	// EligibleGroups, if set, limits unlocking to members of these groups.
 	EligibleGroups []string `yaml:"eligibleGroups"`
-	// DisableOnFailedVerification disables an account if, after it was unlocked, the password
-	// given in step 2 turns out to be wrong.
-	DisableOnFailedVerification bool `yaml:"disableOnFailedVerification"`
 	// SessionLifetime is how long the whole workflow may take from the voucher signing in.
 	SessionLifetime time.Duration `yaml:"sessionLifetime"`
 	// ConfirmWindow is how long the voucher has to confirm after the user enters their details.
@@ -57,7 +56,7 @@ type Policy struct {
 	// AllowClientIPChange lets a session continue from a different client address. Leave it
 	// off unless clients' addresses legitimately change mid-session.
 	AllowClientIPChange bool `yaml:"allowClientIPChange"`
-	// RateLimit caps attempts per client address and per username.
+	// RateLimit caps failed attempts per client address and per account.
 	RateLimit RateLimitConfig `yaml:"rateLimit"`
 }
 
@@ -77,11 +76,10 @@ type Outcome string
 
 // Outcomes.
 const (
-	OutcomeNone               Outcome = ""
-	OutcomeNotLocked          Outcome = "not_locked"
-	OutcomeUnlocked           Outcome = "unlocked"
-	OutcomeVerificationFailed Outcome = "verification_failed"
-	OutcomeIneligible         Outcome = "ineligible"
+	OutcomeNone       Outcome = ""
+	OutcomeNotLocked  Outcome = "not_locked"
+	OutcomeUnlocked   Outcome = "unlocked"
+	OutcomeIneligible Outcome = "ineligible"
 )
 
 // Client identifies the browser making a request.
@@ -102,23 +100,24 @@ type State struct {
 	ConfirmBy       time.Time
 }
 
-// session is one browser's progress through the workflow.
+// session is one browser's progress through the workflow. No password is ever stored on it: the
+// claimant's password is checked during Claim and discarded, and the voucher re-authenticates at
+// Confirm.
 type session struct {
 	mu sync.Mutex
 
-	// auditID identifies the session in logs. The session ID is a secret and is never logged.
+	// auditID identifies the session in the audit log. The session cookie is a secret and is
+	// never logged.
 	auditID         string
 	client          Client
 	expiresAt       time.Time
 	stage           Stage
 	claimedUsername string
 	target          *directory.User
-	// password is the claimant's password, held from step 2 until step 3 and then wiped.
-	password  []byte
-	voucher   *directory.User
-	confirmBy time.Time
-	outcome   Outcome
-	message   string
+	voucher         *directory.User
+	confirmBy       time.Time
+	outcome         Outcome
+	message         string
 }
 
 // state returns a snapshot. mu must be held.
@@ -138,17 +137,8 @@ func (s *session) state() State {
 	return state
 }
 
-// wipe discards the claimant's password. mu must be held.
-func (s *session) wipe() {
-	for i := range s.password {
-		s.password[i] = 0
-	}
-	s.password = nil
-}
-
 // dropClaim discards the claimant so they must enter their details again. mu must be held.
 func (s *session) dropClaim() {
-	s.wipe()
 	s.stage = StageAwaitingClaim
 	s.claimedUsername = ""
 	s.target = nil
@@ -157,7 +147,6 @@ func (s *session) dropClaim() {
 
 // finish moves the session to complete. mu must be held.
 func (s *session) finish(outcome Outcome, message string) {
-	s.wipe()
 	s.stage = StageComplete
 	s.outcome = outcome
 	s.message = message
@@ -167,6 +156,7 @@ func (s *session) finish(outcome Outcome, message string) {
 type Service struct {
 	dir     directory.Directory
 	policy  Policy
+	sink    audit.Sink
 	now     func() time.Time
 	limiter *limiter
 
@@ -182,8 +172,9 @@ func WithClock(now func() time.Time) Option {
 	return func(s *Service) { s.now = now }
 }
 
-// NewService returns a Service. Unset durations in policy get their defaults.
-func NewService(dir directory.Directory, policy Policy, opts ...Option) (*Service, error) {
+// NewService returns a Service. Unset durations in policy get their defaults. sink receives the
+// audit events; the final unlock is gated on it. A nil sink discards events (tests only).
+func NewService(dir directory.Directory, policy Policy, sink audit.Sink, opts ...Option) (*Service, error) {
 	if len(policy.VoucherGroups) == 0 {
 		return nil, errors.New("policy: at least one voucher group is required")
 	}
@@ -196,9 +187,13 @@ func NewService(dir directory.Directory, policy Policy, opts ...Option) (*Servic
 	if policy.RateLimit.Attempts == 0 && policy.RateLimit.Window == 0 {
 		policy.RateLimit = RateLimitConfig{Attempts: DefaultRateAttempts, Window: DefaultRateWindow}
 	}
+	if sink == nil {
+		sink = audit.Nop{}
+	}
 	svc := &Service{
 		dir:      dir,
 		policy:   policy,
+		sink:     sink,
 		now:      time.Now,
 		sessions: map[string]*session{},
 	}
@@ -214,7 +209,7 @@ func (s *Service) Policy() Policy {
 	return s.policy
 }
 
-// Run sweeps expired sessions, wiping any passwords they hold, until ctx is done.
+// Run sweeps expired sessions until ctx is done.
 func (s *Service) Run(ctx context.Context) {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
@@ -222,12 +217,7 @@ func (s *Service) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			s.mu.Lock()
-			for id, sess := range s.sessions {
-				sess.mu.Lock()
-				sess.wipe()
-				sess.mu.Unlock()
-				delete(s.sessions, id)
-			}
+			s.sessions = map[string]*session{}
 			s.mu.Unlock()
 			return
 		case <-ticker.C:
@@ -242,11 +232,11 @@ func (s *Service) Sweep() {
 	s.mu.Lock()
 	for id, sess := range s.sessions {
 		sess.mu.Lock()
-		if !now.Before(sess.expiresAt) {
-			sess.wipe()
+		expired := !now.Before(sess.expiresAt)
+		sess.mu.Unlock()
+		if expired {
 			delete(s.sessions, id)
 		}
-		sess.mu.Unlock()
 	}
 	s.mu.Unlock()
 	s.limiter.Sweep()
@@ -258,7 +248,8 @@ func randomID(size int) string {
 	return base64.RawURLEncoding.EncodeToString(buf)
 }
 
-// auditLog returns the audit logger for a session.
+// auditLog returns the operational logger for a session. It's separate from the audit sink,
+// which records the structured security trail.
 func auditLog(ctx context.Context, sess *session) *zap.Logger {
 	fields := []zap.Field{
 		zap.String("audit_id", sess.auditID),
@@ -273,21 +264,55 @@ func auditLog(ctx context.Context, sess *session) *zap.Logger {
 	return logutil.FromCtx(ctx).Named("audit").With(fields...)
 }
 
-// remove deletes a session and wipes it.
-func (s *Service) remove(sessionID string) {
-	s.mu.Lock()
-	sess, ok := s.sessions[sessionID]
-	delete(s.sessions, sessionID)
-	s.mu.Unlock()
-	if ok {
-		sess.mu.Lock()
-		sess.wipe()
-		sess.mu.Unlock()
+// event builds an audit event prefilled from the session.
+func (s *Service) event(sess *session, eventType, decision string) audit.Event {
+	e := audit.Event{
+		Time:            s.now(),
+		Type:            eventType,
+		Decision:        decision,
+		Session:         sess.auditID,
+		ClientIP:        sess.client.IP,
+		ClientUserAgent: sess.client.UserAgent,
+		Target:          sess.claimedUsername,
+	}
+	if sess.target != nil {
+		e.Target = sess.target.SAMAccountName
+		e.TargetDN = sess.target.DN
+	}
+	if sess.voucher != nil {
+		e.Voucher = sess.voucher.SAMAccountName
+		e.VoucherDN = sess.voucher.DN
+	}
+	return e
+}
+
+// emit records a non-gating event. A sink failure is logged but doesn't stop the workflow, so a
+// transient audit hiccup can't block a voucher sign-in or a rejection. The gating unlock record
+// goes through commit instead.
+func (s *Service) emit(ctx context.Context, sess *session, e audit.Event) {
+	if err := s.sink.Log(ctx, e); err != nil {
+		auditLog(ctx, sess).Error("Audit sink failed to record event",
+			zap.String("event", e.Type), zap.Error(err))
 	}
 }
 
+// commit records a gating event. If the sink can't commit it, the caller must not proceed.
+func (s *Service) commit(ctx context.Context, e audit.Event) error {
+	if err := s.sink.Log(ctx, e); err != nil {
+		return errAuditFailed(err)
+	}
+	return nil
+}
+
+// remove deletes a session.
+func (s *Service) remove(sessionID string) {
+	s.mu.Lock()
+	delete(s.sessions, sessionID)
+	s.mu.Unlock()
+}
+
 // acquire finds a live session made by client and returns it locked. A session from a
-// different browser or address is destroyed.
+// different browser or address is destroyed and audited.
 func (s *Service) acquire(ctx context.Context, sessionID string, client Client) (*session, error) {
 	if sessionID == "" {
 		return nil, errNoSession()
@@ -308,6 +333,10 @@ func (s *Service) acquire(ctx context.Context, sessionID string, client Client) 
 		(!s.policy.AllowClientIPChange && sess.client.IP != client.IP) {
 		auditLog(ctx, sess).Warn("Session used from a different client - cancelling it",
 			zap.String("request_ip", client.IP), zap.String("request_user_agent", client.UserAgent))
+		e := s.event(sess, "presence_mismatch", audit.DecisionDeny)
+		e.Reason = "request from a different browser or address"
+		e.Message = "session used from " + client.IP + " (" + client.UserAgent + ")"
+		s.emit(ctx, sess, e)
 		sess.mu.Unlock()
 		s.remove(sessionID)
 		return nil, errPresenceMismatch()
@@ -347,6 +376,9 @@ func (s *Service) Cancel(ctx context.Context, sessionID string) {
 	if ok {
 		sess.mu.Lock()
 		auditLog(ctx, sess).Info("Session cancelled", zap.String("stage", string(sess.stage)))
+		e := s.event(sess, "session_cancelled", audit.DecisionAttempt)
+		e.Message = "cancelled at stage " + string(sess.stage)
+		s.emit(ctx, sess, e)
 		sess.mu.Unlock()
 		s.remove(sessionID)
 	}
@@ -418,6 +450,10 @@ func (s *Service) StartVouch(ctx context.Context, client Client, username, passw
 	}
 	voucher, err := s.authenticateVoucher(ctx, auditLog(ctx, sess), client, username, password)
 	if err != nil {
+		e := s.event(sess, "voucher_signin", audit.DecisionDeny)
+		e.Voucher = username
+		e.Reason = reasonOf(err)
+		s.emit(ctx, sess, e)
 		return State{Stage: StageStart}, "", err
 	}
 	sess.voucher = voucher
@@ -427,6 +463,7 @@ func (s *Service) StartVouch(ctx context.Context, client Client, username, passw
 	s.sessions[sessionID] = sess
 	s.mu.Unlock()
 	auditLog(ctx, sess).Info("Voucher signed in, waiting for the locked-out user")
+	s.emit(ctx, sess, s.event(sess, "voucher_signin", audit.DecisionSuccess))
 
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
@@ -457,8 +494,8 @@ func (s *Service) checkEligible(ctx context.Context, target *directory.User) (st
 	return "", nil
 }
 
-// Claim is step 2: the locked-out user enters their username and password. If the password
-// works the account isn't locked, and the session completes.
+// Claim is step 2: the locked-out user enters their username and password. vouch confirms the
+// account is locked and eligible, then validates the password without leaving it unlocked.
 func (s *Service) Claim(ctx context.Context, sessionID string, client Client, username, password string) (State, error) {
 	sess, err := s.acquire(ctx, sessionID, client)
 	if err != nil {
@@ -484,6 +521,7 @@ func (s *Service) Claim(ctx context.Context, sessionID string, client Client, us
 	if errors.Is(err, directory.ErrUserNotFound) {
 		log.Info("Claim rejected: unknown user")
 		s.limiter.Fail(keys...)
+		s.claimDeny(ctx, sess, username, "unknown user")
 		return sess.state(), errInvalidCredentials()
 	}
 	if err != nil {
@@ -494,6 +532,7 @@ func (s *Service) Claim(ctx context.Context, sessionID string, client Client, us
 
 	if user.SameAs(sess.voucher) {
 		log.Warn("Claim rejected: voucher tried to vouch for themselves")
+		s.claimDeny(ctx, sess, username, "voucher is the claimant")
 		return sess.state(), newError(CodeVoucherIsClaimant,
 			"You can't vouch for yourself. The locked-out user must enter their own details.")
 	}
@@ -504,18 +543,25 @@ func (s *Service) Claim(ctx context.Context, sessionID string, client Client, us
 		return sess.state(), errRateLimited()
 	}
 
-	result, err := s.dir.Authenticate(ctx, user, []byte(password))
+	// A bind reveals the status without changing it: a locked account answers "locked out"
+	// whatever the password, so this neither verifies nor unlocks it. Only once we know the
+	// account is genuinely locked (and eligible) do we unlock to verify, so claiming can't be
+	// used to lock an innocent account.
+	status, err := s.dir.Authenticate(ctx, user, []byte(password))
 	if err != nil {
 		log.Error("Claim failed: directory bind error", zap.Error(err))
 		return sess.state(), directoryError(err)
 	}
-	log = log.With(zap.String("bind_result", result.String()))
+	log = log.With(zap.String("status", status.String()))
 
-	switch result {
+	switch status {
 	case directory.BindOK:
 		log.Info("Claim: account is not locked")
 		sess.claimedUsername = username
 		sess.target = user
+		e := s.event(sess, "claim_not_locked", audit.DecisionSuccess)
+		e.BindResult = status.String()
+		s.emit(ctx, sess, e)
 		sess.finish(OutcomeNotLocked, "This account's password works and it isn't locked. "+
 			"The user can sign in normally.")
 		return sess.state(), nil
@@ -524,14 +570,17 @@ func (s *Service) Claim(ctx context.Context, sessionID string, client Client, us
 	case directory.BindInvalidCredentials:
 		log.Info("Claim rejected: invalid credentials")
 		s.limiter.Fail(keys...)
+		s.claimDeny(ctx, sess, username, "invalid credentials")
 		return sess.state(), errInvalidCredentials()
 	case directory.BindPasswordExpired:
 		log.Info("Claim rejected: password expired")
+		s.claimDeny(ctx, sess, username, "password expired")
 		return sess.state(), newError(CodeAccountRestricted,
 			"This account isn't locked, but its password has expired. Change it the usual way, "+
 				"or contact the service desk.")
 	default:
 		log.Info("Claim rejected: account restricted")
+		s.claimDeny(ctx, sess, username, "account restricted ("+status.String()+")")
 		return sess.state(), newError(CodeAccountRestricted,
 			"This account can't be unlocked here. Please contact the service desk.")
 	}
@@ -547,23 +596,69 @@ func (s *Service) Claim(ctx context.Context, sessionID string, client Client, us
 	}
 	if reason != "" {
 		log.Warn("Target is not eligible for self-service unlock", zap.String("reason", reason))
+		e := s.event(sess, "claim_ineligible", audit.DecisionDeny)
+		e.Reason = reason
+		s.emit(ctx, sess, e)
 		sess.finish(OutcomeIneligible, "This account can't be unlocked by self-service. Please contact the service desk.")
 		return sess.state(), nil
 	}
 
-	sess.password = []byte(password)
+	// The account is locked and eligible. Unlock briefly, verify the password, and re-lock.
+	pw := []byte(password)
+	result, err := s.dir.VerifyWhileLocked(ctx, user, pw)
+	zeroBytes(pw)
+	if errors.Is(err, directory.ErrRelockFailed) {
+		log.Error("Could not re-lock account after verifying; it was disabled as a safeguard", zap.Error(err))
+		e := s.event(sess, "relock_failed", audit.DecisionFailure)
+		e.Reason = err.Error()
+		e.Message = "account could not be re-locked after verification and was disabled"
+		s.emit(ctx, sess, e)
+		sess.finish(OutcomeIneligible,
+			"Something went wrong unlocking this account and it has been secured. Please contact the service desk.")
+		return sess.state(), nil
+	}
+	if err != nil {
+		log.Error("Claim failed: verifying password", zap.Error(err))
+		return sess.state(), directoryError(err)
+	}
+	if result != directory.BindOK {
+		log.Info("Claim rejected: password did not match", zap.String("bind_result", result.String()))
+		s.limiter.Fail(keys...)
+		e := s.event(sess, "claim_verify", audit.DecisionDeny)
+		e.Reason = "password did not match"
+		e.BindResult = result.String()
+		s.emit(ctx, sess, e)
+		// The account stays locked; let the user try again within this session.
+		sess.target = nil
+		sess.claimedUsername = ""
+		return sess.state(), errInvalidCredentials()
+	}
+
 	sess.stage = StageAwaitingConfirmation
 	sess.confirmBy = s.now().Add(s.policy.ConfirmWindow)
 	if sess.confirmBy.After(sess.expiresAt) {
 		sess.confirmBy = sess.expiresAt
 	}
-	log.Info("Claim accepted: account is locked, waiting for the voucher to confirm",
-		zap.Time("lockout_time", user.LockoutTime))
+	log.Info("Claim accepted: password verified, account re-locked, waiting for the voucher to confirm")
+	e := s.event(sess, "claim_verify", audit.DecisionSuccess)
+	e.BindResult = result.String()
+	e.Message = "password verified; account re-locked pending confirmation"
+	s.emit(ctx, sess, e)
 	return sess.state(), nil
 }
 
+// claimDeny records a denied claim.
+func (s *Service) claimDeny(ctx context.Context, sess *session, username, reason string) {
+	e := s.event(sess, "claim", audit.DecisionDeny)
+	if e.Target == "" {
+		e.Target = username
+	}
+	e.Reason = reason
+	s.emit(ctx, sess, e)
+}
+
 // Confirm is step 3: the voucher attests to the claimant's identity and re-enters their own
-// credentials. The account is unlocked and the claimant's password is verified.
+// credentials. An audit record is committed, and only then is the account unlocked.
 func (s *Service) Confirm(ctx context.Context, sessionID string, client Client,
 	username, password string, attest bool,
 ) (State, error) {
@@ -597,47 +692,63 @@ func (s *Service) Confirm(ctx context.Context, sessionID string, client Client,
 		!strings.EqualFold(username, sess.voucher.UserPrincipalName) {
 		log.Warn("Confirmation rejected: a different voucher tried to confirm",
 			zap.String("confirming_username", username))
+		e := s.event(sess, "confirm", audit.DecisionDeny)
+		e.Reason = "different voucher"
+		s.emit(ctx, sess, e)
 		return sess.state(), errVoucherMismatch(sess.voucher)
 	}
 	voucher, err := s.authenticateVoucher(ctx, log, client, username, password)
 	if err != nil {
+		e := s.event(sess, "confirm", audit.DecisionDeny)
+		e.Reason = reasonOf(err)
+		s.emit(ctx, sess, e)
 		return sess.state(), err
 	}
 	if !voucher.SameAs(sess.voucher) {
 		log.Warn("Confirmation rejected: signed in as a different voucher",
 			zap.String("confirming_voucher_dn", voucher.DN))
+		e := s.event(sess, "confirm", audit.DecisionDeny)
+		e.Reason = "different voucher"
+		s.emit(ctx, sess, e)
 		return sess.state(), errVoucherMismatch(sess.voucher)
 	}
 
-	result, err := s.dir.UnlockAndVerify(ctx, sess.target, sess.password)
-	sess.wipe()
-	if err != nil {
+	// Commit the authorisation to the audit log BEFORE unlocking. If it can't be committed, the
+	// account is not unlocked.
+	authEvent := s.event(sess, "unlock_authorized", audit.DecisionAllow)
+	authEvent.Message = "voucher " + voucher.SAMAccountName + " authorised unlocking " + sess.target.SAMAccountName
+	if err := s.commit(ctx, authEvent); err != nil {
+		log.Error("Unlock not carried out: audit record could not be committed", zap.Error(err))
+		return sess.state(), err
+	}
+
+	if err := s.dir.Unlock(ctx, sess.target); err != nil {
 		log.Error("Unlock failed", zap.Error(err))
+		e := s.event(sess, "unlock", audit.DecisionFailure)
+		e.Reason = err.Error()
+		s.emit(ctx, sess, e)
 		sess.finish(OutcomeNone, "")
 		return sess.state(), directoryError(err)
 	}
-	log = log.With(zap.String("bind_result", result.String()))
 
-	if result == directory.BindOK {
-		log.Info("Account unlocked and password verified")
-		sess.finish(OutcomeUnlocked, "The account is unlocked. The user can sign in now.")
-		return sess.state(), nil
-	}
-
-	s.limiter.Fail("ip:"+client.IP, dnRateKey(sess.target))
-	message := "The account was unlocked, but the password the user entered was wrong. " +
-		"If they've forgotten their password, contact the service desk to reset it."
-	if s.policy.DisableOnFailedVerification {
-		if err := s.dir.Disable(ctx, sess.target); err != nil {
-			log.Error("Password verification failed after unlock, and disabling the account failed", zap.Error(err))
-		} else {
-			log.Warn("Password verification failed after unlock: account disabled")
-			message = "The password the user entered was wrong, so the account has been disabled. " +
-				"Contact the service desk."
-		}
-	} else {
-		log.Warn("Password verification failed after unlock: account left unlocked")
-	}
-	sess.finish(OutcomeVerificationFailed, message)
+	log.Info("Account unlocked")
+	s.emit(ctx, sess, s.event(sess, "unlock", audit.DecisionSuccess))
+	sess.finish(OutcomeUnlocked, "The account is unlocked. The user can sign in now.")
 	return sess.state(), nil
+}
+
+// zeroBytes overwrites b, to limit how long a password lingers in memory.
+func zeroBytes(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
+}
+
+// reasonOf returns the Code of an *Error as a short reason string for the audit log.
+func reasonOf(err error) string {
+	var unlockErr *Error
+	if errors.As(err, &unlockErr) {
+		return string(unlockErr.Code)
+	}
+	return "error"
 }

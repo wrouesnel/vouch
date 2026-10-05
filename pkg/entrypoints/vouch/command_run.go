@@ -11,7 +11,9 @@ import (
 	"github.com/chigopher/pathlib"
 	"github.com/labstack/echo/v5"
 	"github.com/spf13/afero"
+	"github.com/wrouesnel/ctxstdio"
 	logutil "github.com/wrouesnel/go.logutil"
+	"github.com/wrouesnel/vouch/pkg/audit"
 	"github.com/wrouesnel/vouch/pkg/directory"
 	"github.com/wrouesnel/vouch/pkg/server"
 	"github.com/wrouesnel/vouch/pkg/unlock"
@@ -59,6 +61,26 @@ func loadDirectory(cli *CLIConfig, cfg directory.Config) (*directory.LDAP, error
 	return directory.NewLDAP(cfg, rootCAs)
 }
 
+// buildAuditSink resolves any secret files in the audit config (relative to the config file)
+// and builds the sink. Its stderr fallback writes to the context's standard error.
+func buildAuditSink(cli *CLIConfig, ctx context.Context, cfg audit.Config) (audit.Sink, error) {
+	if cfg.SQL != nil && cfg.SQL.DSN == "" && cfg.SQL.DSNFile != "" {
+		dsn, err := resolvePath(cli, cfg.SQL.DSNFile).ReadFile()
+		if err != nil {
+			return nil, fmt.Errorf("reading audit.sql.dsnFile: %w", err)
+		}
+		cfg.SQL.DSN = strings.TrimRight(string(dsn), "\r\n")
+	}
+	if cfg.HTTP != nil && cfg.HTTP.Token == "" && cfg.HTTP.TokenFile != "" {
+		token, err := resolvePath(cli, cfg.HTTP.TokenFile).ReadFile()
+		if err != nil {
+			return nil, fmt.Errorf("reading audit.http.tokenFile: %w", err)
+		}
+		cfg.HTTP.Token = strings.TrimRight(string(token), "\r\n")
+	}
+	return audit.New(cfg, ctxstdio.StdErr(ctx))
+}
+
 // Run is invoked by kong with the values bound in Entrypoint.
 func (r *RunCmd) Run(ctx context.Context, cli *CLIConfig, config *EntrypointConfig) error {
 	l := logutil.FromCtx(ctx)
@@ -67,7 +89,18 @@ func (r *RunCmd) Run(ctx context.Context, cli *CLIConfig, config *EntrypointConf
 	if err != nil {
 		return err
 	}
-	svc, err := unlock.NewService(dir, config.Policy)
+
+	sink, err := buildAuditSink(cli, ctx, config.Audit)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = sink.Close() }()
+	if !config.Audit.IsDurable() {
+		l.Warn("No durable audit sink configured; audit goes to stderr only. " +
+			"Configure audit.file, audit.sql or audit.http for a durable, gated audit trail.")
+	}
+
+	svc, err := unlock.NewService(dir, config.Policy, sink)
 	if err != nil {
 		return err
 	}

@@ -296,7 +296,6 @@ function showComplete(state: SessionState): void {
   const outcomes = {
     unlocked: { kind: "success", heading: "Account unlocked" },
     not_locked: { kind: "info", heading: "This account isn't locked" },
-    verification_failed: { kind: "error", heading: "Password check failed" },
     ineligible: { kind: "error", heading: "Can't unlock this account here" },
   } as const;
   const outcome = state.outcome ? outcomes[state.outcome] : { kind: "error", heading: "Something went wrong" };

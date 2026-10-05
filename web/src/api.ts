@@ -1,7 +1,7 @@
 // Client for the vouch API. Types mirror api/vouch.yaml.
 
 export type Stage = "start" | "awaiting_claim" | "awaiting_confirmation" | "complete";
-export type Outcome = "not_locked" | "unlocked" | "verification_failed" | "ineligible";
+export type Outcome = "not_locked" | "unlocked" | "ineligible";
 
 export interface Info {
   title: string;

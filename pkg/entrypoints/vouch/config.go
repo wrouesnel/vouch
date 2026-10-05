@@ -2,6 +2,7 @@ package vouch
 
 import (
 	"github.com/chigopher/pathlib"
+	"github.com/wrouesnel/vouch/pkg/audit"
 	"github.com/wrouesnel/vouch/pkg/directory"
 	"github.com/wrouesnel/vouch/pkg/server"
 	"github.com/wrouesnel/vouch/pkg/unlock"
@@ -38,4 +39,6 @@ type EntrypointConfig struct {
 	Directory directory.Config `yaml:"directory"`
 	// Policy decides who may vouch and who may be unlocked.
 	Policy unlock.Policy `yaml:"policy"`
+	// Audit configures where the audit trail is written. The unlock is gated on it.
+	Audit audit.Config `yaml:"audit"`
 }

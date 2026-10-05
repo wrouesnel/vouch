@@ -16,22 +16,39 @@ vouches for the user in person, in the same browser.
    colleague can't enter their own account here.
 3. **The colleague checks the details, confirms they are with the user and have confirmed their
    identity, and enters their own username and password again.** It must be the same account
-   that started the session. vouch then clears the account's lockout and immediately binds as
-   the user with the password from step 2, against the same domain controller, to verify it.
+   that started the session. vouch commits an audit record, and only then clears the lockout.
 
-### Why the password is checked after unlocking
+### The account's status, and why the password check unlocks then re-locks
 
-While an account is locked, AD rejects every bind with `data 775`, whether or not the password
-is right. There's no way to verify a locked user's password without unlocking the account first.
-vouch therefore holds the password from step 2 in memory, server side only, until the colleague
-confirms. It then unlocks the account and verifies the password straight away. This was confirmed
-against the Samba AD DC in [`test/samba`](test/samba/README.md).
+The account being unlocked starts **locked**. While it's locked, AD answers every bind `data 775`
+whether or not the password is right, so a locked account's password can't be checked without
+first unlocking it (confirmed against the Samba AD DC in [`test/samba`](test/samba/README.md)).
 
-If the password turns out to be wrong, the account is already unlocked. The outcome is reported
-as `verification_failed` and logged as a warning. The account's bad-password count starts again
-from zero, so the person can make a few more guesses before AD locks it again. If that matters
-more to you than the extra help-desk calls, set `policy.disableOnFailedVerification: true` and
-vouch will disable the account instead.
+vouch handles this without ever leaving the account unlocked while it waits for the colleague:
+
+* At the claim (step 2) it first binds as the user to confirm the account really is **locked**,
+  and checks it's eligible. A bind reveals the status without changing it, so this can't be used
+  to unlock or lock anyone.
+* Only then does it briefly clear the lockout, bind as the user to check the password, and
+  **re-lock** the account. AD doesn't allow writing a non-zero `lockoutTime`, so the re-lock is
+  done the way AD itself locks accounts: failed binds up to the account's lockout threshold
+  (read from its resultant password-settings object, else the domain policy). The account is
+  unlocked only for the few milliseconds this takes.
+* The password is checked here, once, and **discarded** — vouch keeps no password between steps.
+  If it's wrong, the account is simply left locked and the user can try again.
+* The final, permanent unlock happens at step 3, after the colleague confirms. Because the
+  password was already verified, a wrong password can never result in an unlocked account.
+
+The re-lock generates failed-logon events (Windows event 4625) on the domain controller, and
+every one is recorded in vouch's own audit log. If the account can't be re-locked for any reason
+(for example lockout is disabled, so there's no threshold to reach), vouch **disables** the
+account as a fail-safe rather than leave it unlocked, and records a `relock_failed` audit event.
+
+### The unlock is gated on a committed audit record
+
+Before it clears the lockout, vouch writes an `unlock_authorized` record to the audit sink and
+waits for it to commit. **If the audit record can't be committed, the account is not unlocked**
+and the colleague is told to try again. See [Audit trail](#audit-trail).
 
 ### Keeping both people in the same place
 
@@ -58,31 +75,82 @@ the room. Both people type a password on the same machine, so only use vouch on 
 trust with both. The page asks password managers and browsers not to save either person's
 credentials, but browsers don't always comply.
 
-### Audit log
+### Audit trail
 
-Every decision is logged on the `audit` logger with an `audit_id` per session, the client
-address, the claimed user, the voucher, and the AD bind result. Session IDs and passwords are
-never logged. Use `--log-format json` to ship the log to a SIEM.
+Every security-relevant action is written to an audit sink as a structured event: the voucher
+signing in, the password check and re-lock, the authorisation and the unlock, rejections,
+presence mismatches and cancellations. Each event carries a per-session audit id (not the secret
+session cookie), the client address and user-agent, the voucher, the target account and the
+outcome. Passwords and session cookies are never recorded.
+
+Configure one or more sinks under `audit:` in the config; events go to all of them:
+
+* **file** — one JSON object per line, `fsync`'d per event.
+* **sql** — one row per event (PostgreSQL via `pgx`, MySQL or SQLite). Create the table first:
+
+  ```sql
+  CREATE TABLE vouch_audit (
+    id                BIGSERIAL PRIMARY KEY,
+    event_time        TIMESTAMPTZ NOT NULL,
+    event_type        TEXT NOT NULL,
+    decision          TEXT NOT NULL,
+    reason            TEXT,
+    session           TEXT,
+    client_ip         TEXT,
+    client_user_agent TEXT,
+    voucher           TEXT,
+    voucher_dn        TEXT,
+    target            TEXT,
+    target_dn         TEXT,
+    bind_result       TEXT,
+    outcome           TEXT,
+    message           TEXT,
+    detail            JSONB
+  );
+  ```
+
+  (Use `SERIAL`/`AUTO_INCREMENT` and `JSON`/`TEXT` to suit your database. `detail` holds the
+  whole event as JSON.)
+* **http** — POST each event as JSON, including to a **Splunk HTTP Event Collector** (`splunk:
+  true` wraps the event and sends the HEC token). Failed deliveries are retried.
+
+The **final unlock is gated on the audit record**: vouch writes the `unlock_authorized` event and
+clears the lockout only if every configured sink commits it. If a sink fails, the unlock is
+refused with an `audit_failed` error and the account stays locked. Non-gating events (sign-ins,
+rejections) are best-effort: a sink failure is logged but doesn't block the step.
+
+Keep credentials out of the config file with `audit.sql.dsnFile` and `audit.http.tokenFile`,
+which are read from separate files. If no durable sink is configured, events go to stderr only
+and vouch logs a warning at startup. vouch's own operational logs (`--log-format json`) are
+separate from this audit trail.
 
 ## Active Directory setup
 
-**Service account.** Create a dedicated account (e.g. `svc-vouch`). It needs:
+**Service account.** vouch needs a dedicated account (e.g. `svc-vouch`). It needs:
 
-* Read access to users and groups. Domain Users already have this by default.
-* Write access to `lockoutTime` on the user objects that may be unlocked:
+* Read access to users and groups — Domain Users has this by default — including the lockout
+  threshold (`lockoutThreshold` on the domain, or `msDS-LockoutThreshold` on a password-settings
+  object), which is readable by default.
+* Write access to `lockoutTime` on the user objects that may be unlocked, to clear and (during
+  the password check) restore the lock:
 
   ```bat
   dsacls "OU=Staff,DC=example,DC=com" /I:S /G "EXAMPLE\svc-vouch:WP;lockoutTime;user"
   ```
 
-* Write access to `userAccountControl` as well, but only if `disableOnFailedVerification` is on:
+* Write access to `userAccountControl`, used only by the fail-safe that disables an account if it
+  can't be re-locked after the password check:
 
   ```bat
   dsacls "OU=Staff,DC=example,DC=com" /I:S /G "EXAMPLE\svc-vouch:RPWP;userAccountControl;user"
   ```
 
+The re-lock itself needs no permission — anyone may attempt a bind. Give the account a long,
+random password and no interactive-logon rights; it only ever binds and edits those two
+attributes.
+
 Don't delegate at the domain root. Accounts protected by AdminSDHolder (`adminCount=1`) don't
-inherit delegations, so the service account can't unlock domain admins even if they aren't in a
+inherit delegations, so the service account can't touch domain admins even if they aren't in a
 protected group. List them in `protectedGroups` anyway, so vouch refuses before it tries.
 
 **Voucher groups.** Create or choose a group such as the service desk or team leads, and list
@@ -102,7 +170,8 @@ sections are:
 |---|---|
 | `web` | Listen address, optional TLS, trusted reverse proxies, and page text. |
 | `directory` | Domain controller URLs, TLS trust, base DN, service account, user filter. |
-| `policy` | Voucher, protected and eligible groups, time limits, rate limits, and what to do if verification fails. |
+| `policy` | Voucher, protected and eligible groups, time limits and rate limits. |
+| `audit` | The audit sinks (file, SQL, HTTP/Splunk). The final unlock is gated on these. |
 
 Run vouch behind HTTPS. Either set `web.tlsCertFile`/`web.tlsKeyFile`, or put it behind a
 reverse proxy and list the proxy in `web.trustedProxies` so the real client address is used for
@@ -154,8 +223,9 @@ Dockerfile fails CI. The build is `.github/workflows/container.yml`, called from
 | Path | Purpose |
 |---|---|
 | `api/vouch.yaml` | OpenAPI 3 definition of the API. `go generate ./pkg/api` regenerates the Echo v5 server in `pkg/api`. |
-| `pkg/directory` | AD access over LDAP: lookups, binds, nested groups, unlock. `directorytest` holds an in-memory fake with AD's lockout behaviour. |
-| `pkg/unlock` | The workflow: sessions, presence checks, eligibility, rate limits and audit logging. |
+| `pkg/directory` | AD access over LDAP: lookups, binds, nested groups, verify-while-locked and unlock. `directorytest` holds an in-memory fake with AD's lockout behaviour. |
+| `pkg/unlock` | The workflow: sessions, presence checks, eligibility, rate limits and the audit-gated unlock. |
+| `pkg/audit` | Audit sinks (file, SQL, HTTP/Splunk) and the commit gate. |
 | `pkg/server` | Echo HTTP server: API handlers, cookies, security headers, and the embedded web interface. |
 | `pkg/entrypoints/vouch` | Command line, configuration and startup. |
 | `web/` | TypeScript and Vite web interface. `npm run dev` serves it with the API proxied to `:8080`. |

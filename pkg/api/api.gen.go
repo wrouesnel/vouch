@@ -19,10 +19,9 @@ import (
 
 // Defines values for Outcome.
 const (
-	Ineligible         Outcome = "ineligible"
-	NotLocked          Outcome = "not_locked"
-	Unlocked           Outcome = "unlocked"
-	VerificationFailed Outcome = "verification_failed"
+	Ineligible Outcome = "ineligible"
+	NotLocked  Outcome = "not_locked"
+	Unlocked   Outcome = "unlocked"
 )
 
 // Valid indicates whether the value is a known member of the Outcome enum.
@@ -34,8 +33,6 @@ func (e Outcome) Valid() bool {
 		return true
 	case Unlocked:
 		return true
-	case VerificationFailed:
-		return true
 	default:
 		return false
 	}
@@ -45,6 +42,7 @@ func (e Outcome) Valid() bool {
 const (
 	AccountRestricted    ProblemCode = "account_restricted"
 	AttestationRequired  ProblemCode = "attestation_required"
+	AuditFailed          ProblemCode = "audit_failed"
 	BadRequest           ProblemCode = "bad_request"
 	DirectoryError       ProblemCode = "directory_error"
 	InvalidCredentials   ProblemCode = "invalid_credentials"
@@ -64,6 +62,8 @@ func (e ProblemCode) Valid() bool {
 	case AccountRestricted:
 		return true
 	case AttestationRequired:
+		return true
+	case AuditFailed:
 		return true
 	case BadRequest:
 		return true
@@ -163,8 +163,7 @@ type Info struct {
 }
 
 // Outcome * `not_locked` - the password works, so the account isn't locked.
-// * `unlocked` - the account was unlocked and the password verified.
-// * `verification_failed` - the account was unlocked but the password from step 2 was wrong.
+// * `unlocked` - the account's lockout was cleared after the voucher confirmed.
 // * `ineligible` - this account can't be unlocked by self-service.
 type Outcome string
 
@@ -192,8 +191,7 @@ type SessionState struct {
 	Message *string `json:"message,omitempty"`
 
 	// Outcome * `not_locked` - the password works, so the account isn't locked.
-	// * `unlocked` - the account was unlocked and the password verified.
-	// * `verification_failed` - the account was unlocked but the password from step 2 was wrong.
+	// * `unlocked` - the account's lockout was cleared after the voucher confirmed.
 	// * `ineligible` - this account can't be unlocked by self-service.
 	Outcome *Outcome `json:"outcome,omitempty"`
 	Stage   Stage    `json:"stage"`
@@ -355,40 +353,40 @@ func RegisterHandlersWithOptions(router EchoRouter, si ServerInterface, options 
 // const string: with thousands of chunks the chained `+` fold is several
 // times slower for the Go compiler than parsing a slice literal.
 var swaggerSpec = []string{
-	"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",
+	"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",
 }
 
 // decodeSpec returns the embedded OpenAPI spec as raw JSON bytes,

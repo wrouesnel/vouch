@@ -47,8 +47,6 @@ policy:
     - "CN=Enterprise Admins,CN=Users,DC=example,DC=com"
   # If set, only members of these groups can be unlocked.
   # eligibleGroups: []
-  # Disable an account if, after unlocking it, the password the user entered turns out to be wrong.
-  disableOnFailedVerification: false
   # How long the whole exchange may take from the voucher signing in, and how long the voucher
   # has to confirm after the user enters their details.
   sessionLifetime: 5m
@@ -59,3 +57,28 @@ policy:
   rateLimit:
     attempts: 10
     window: 15m
+
+# The audit trail. The final unlock is committed here before it happens: if no configured sink
+# can commit the record, the account is not unlocked. Set any combination of sinks; events go to
+# all of them. With none set, events go to stderr only (not durable) and a warning is logged.
+audit:
+  # Append JSON lines to a local file, fsync'd per event.
+  file:
+    path: /var/log/vouch/audit.log
+  # Insert a row per event. Create the table first (see the README for the DDL).
+  # Drivers: pgx/postgres, mysql, sqlite.
+  # sql:
+  #   driver: pgx
+  #   dsn: "postgres://vouch:secret@db.example.com/vouch?sslmode=require"
+  #   dsnFile: audit-db.dsn   # read the DSN from a file instead, to keep it out of config
+  #   table: vouch_audit
+  # POST each event to an HTTP endpoint, such as a Splunk HTTP Event Collector.
+  # http:
+  #   url: https://splunk.example.com:8088/services/collector/event
+  #   splunk: true
+  #   tokenFile: splunk-hec.token
+  #   sourcetype: vouch:audit
+  #   index: security
+  #   retries: 3
+  # Also write JSON lines to stderr. Defaults to true only when no other sink is set.
+  # stderr: false

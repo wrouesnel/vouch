@@ -5,6 +5,7 @@ package directorytest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -30,8 +31,12 @@ type Fake struct {
 	LockoutThreshold int
 	// Err, if set, is returned by every operation.
 	Err error
-	// Unlocks counts calls to UnlockAndVerify.
+	// RelockErr, if set, makes VerifyWhileLocked fail to re-lock (and so disable the account).
+	RelockErr error
+	// Unlocks counts calls to Unlock (the final, permanent unlock).
 	Unlocks int
+	// Verifications counts calls to VerifyWhileLocked.
+	Verifications int
 	// Binds counts bind attempts per sAMAccountName.
 	Binds map[string]int
 }
@@ -192,21 +197,56 @@ func (f *Fake) IsMemberOfAny(_ context.Context, user *directory.User, groupDNs [
 }
 
 // UnlockAndVerify implements directory.Directory.
-func (f *Fake) UnlockAndVerify(_ context.Context, user *directory.User, password []byte) (directory.BindResult, error) {
+func (f *Fake) VerifyWhileLocked(_ context.Context, user *directory.User, password []byte) (directory.BindResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.Err != nil {
 		return directory.BindFailed, f.Err
 	}
+	if f.RelockErr != nil {
+		// Mimic the real client: on a re-lock failure the account is disabled and locked state
+		// is indeterminate, so treat it as disabled-and-locked here.
+		found := f.byDN(user.DN)
+		if found != nil {
+			found.User.UserAccountControl |= 0x2
+		}
+		return directory.BindFailed, fmt.Errorf("%w: account disabled as a safeguard", directory.ErrRelockFailed)
+	}
 	found := f.byDN(user.DN)
 	if found == nil {
 		return directory.BindFailed, errors.New("no such object")
+	}
+	if f.LockoutThreshold <= 0 {
+		return directory.BindFailed, directory.ErrLockoutNotConfigured
+	}
+	f.Verifications++
+	// Unlock, check the password, then re-lock: the account is locked again on return.
+	result := directory.BindInvalidCredentials
+	if string(password) == found.Password && !found.User.Disabled() {
+		result = directory.BindOK
+	}
+	found.Locked = true
+	found.BadPwdCount = f.LockoutThreshold
+	found.User.LockoutTime = time.Now()
+	return result, nil
+}
+
+// Unlock implements directory.Directory.
+func (f *Fake) Unlock(_ context.Context, user *directory.User) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.Err != nil {
+		return f.Err
+	}
+	found := f.byDN(user.DN)
+	if found == nil {
+		return directory.ErrUserNotFound
 	}
 	f.Unlocks++
 	found.Locked = false
 	found.BadPwdCount = 0
 	found.User.LockoutTime = time.Time{}
-	return f.bind(user.DN, password), nil
+	return nil
 }
 
 // Disable implements directory.Directory.

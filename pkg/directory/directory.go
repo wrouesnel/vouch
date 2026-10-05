@@ -16,6 +16,15 @@ import (
 // ErrUserNotFound is returned when a username doesn't match exactly one user.
 var ErrUserNotFound = errors.New("user not found")
 
+// ErrRelockFailed is returned (wrapped) when an account could not be re-locked after a
+// VerifyWhileLocked. The account is disabled as a safeguard before this is returned.
+var ErrRelockFailed = errors.New("could not re-lock account")
+
+// ErrLockoutNotConfigured is returned when the account's effective lockout threshold is zero,
+// so it can't be re-locked by failing binds. Such an account can't become locked by policy
+// in the first place.
+var ErrLockoutNotConfigured = errors.New("account lockout is not configured")
+
 // BindResult classifies the outcome of binding as a user.
 type BindResult int
 
@@ -99,6 +108,10 @@ func ClassifyBindError(err error) (BindResult, error) {
 const (
 	uacAccountDisable = 0x2
 )
+
+// ufLockout is the UF_LOCKOUT bit in msDS-User-Account-Control-Computed. It's set when the
+// account is currently locked out.
+const ufLockout = 0x10
 
 // User is a user object read from the directory.
 type User struct {
@@ -194,9 +207,15 @@ type Directory interface {
 	// IsMemberOfAny reports whether the user is a member, directly or through nested groups,
 	// of any of the groups.
 	IsMemberOfAny(ctx context.Context, user *User, groupDNs []string) (bool, error)
-	// UnlockAndVerify clears the account's lockout and then binds as the user to verify the
-	// password, both against the same domain controller.
-	UnlockAndVerify(ctx context.Context, user *User, password []byte) (BindResult, error)
+	// VerifyWhileLocked validates a locked account's password without leaving it unlocked. It
+	// briefly clears the lockout, binds as the user to check the password, then re-locks the
+	// account, all against one domain controller. The caller must have already confirmed the
+	// account is locked, or an innocent account could be locked by the re-lock. On return the
+	// account is locked again; if it could not be re-locked the account is disabled as a
+	// safeguard and an error wrapping ErrRelockFailed is returned.
+	VerifyWhileLocked(ctx context.Context, user *User, password []byte) (BindResult, error)
+	// Unlock clears the account's lockout. This is the final, permanent unlock.
+	Unlock(ctx context.Context, user *User) error
 	// Disable disables the account.
 	Disable(ctx context.Context, user *User) error
 }
