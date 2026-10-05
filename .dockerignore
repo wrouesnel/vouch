@@ -8,4 +8,6 @@
 /.node/
 /.node.tmp/
 /web/node_modules/
-/web/dist/
+# Keep the tracked placeholder, or git sees it deleted and stamps the version "-dirty".
+/web/dist/*
+!/web/dist/.gitkeep

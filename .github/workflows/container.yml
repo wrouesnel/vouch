@@ -28,6 +28,11 @@ jobs:
           # Full history and tags let `git describe` stamp the version.
           fetch-depth: 0
 
+      # On a tag push, actions/checkout replaces the annotated tag with a lightweight one, which
+      # `git describe` ignores. Re-fetch the real tags.
+      - name: Fetch tags
+        run: git fetch --force --tags origin
+
       # No QEMU needed: the Dockerfile cross-compiles on the build platform, and the final
       # stage only copies files.
       - name: Set up Docker Buildx
