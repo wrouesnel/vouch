@@ -22,7 +22,7 @@ require (
 	go.uber.org/zap v1.28.0
 	go.yaml.in/yaml/v4 v4.0.0-rc.6
 	golang.org/x/mod v0.41.0
-	golang.org/x/text v0.40.0
+	golang.org/x/text v0.42.0
 	modernc.org/sqlite v1.60.1
 )
 
