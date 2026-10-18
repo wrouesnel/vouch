@@ -22,7 +22,7 @@ require (
 	go.uber.org/zap v1.28.0
 	go.yaml.in/yaml/v4 v4.0.0-rc.6
 	golang.org/x/mod v0.41.0
-	golang.org/x/text v0.40.0
+	golang.org/x/text v0.43.0
 	modernc.org/sqlite v1.60.1
 )
 
@@ -55,7 +55,7 @@ require (
 	github.com/yuseferi/zax/v2 v2.5.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/crypto v0.54.0 // indirect
-	golang.org/x/sync v0.23.0 // indirect
+	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	modernc.org/libc v1.77.1 // indirect
