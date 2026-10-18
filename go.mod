@@ -5,7 +5,7 @@ go 1.27.1
 require (
 	github.com/alecthomas/kong v1.16.1
 	github.com/chigopher/pathlib v0.19.1
-	github.com/getkin/kin-openapi v0.149.0
+	github.com/getkin/kin-openapi v0.150.0
 	github.com/go-ldap/ldap/v3 v3.4.14
 	github.com/go-sql-driver/mysql v1.10.1
 	github.com/integralist/go-findroot v0.0.0-20160518114804-ac90681525dc
